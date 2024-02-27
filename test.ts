@@ -1,11 +1,13 @@
 import { interprete } from "./interpreter.ts";
 
 interprete(`
-           match Num Num {
-             1
-           } Type {
-             Or
+           a = if true { b = 1 } { b = null }
+
+           c = match a Num {
+             d = 1
            } else {
-             true
+             d = 2
            }
+
+           print c
 `);

@@ -15,7 +15,7 @@ export function interprete(text: string, env?: Environment): Environment {
 
   env = env ?? new Environment();
 
-  syntaxs = new TypeParser(syntaxs, env).run();
+  syntaxs = typeParser(syntaxs, env);
   console.dir(syntaxs, { depth: 10 });
   env = evaler(syntaxs, env);
   return env;
@@ -24,6 +24,7 @@ export function interprete(text: string, env?: Environment): Environment {
 function dumpObj(obj: object): string {
   const props: { key: string; value: object }[] = [];
   for (const key in obj) {
+    // @ts-ignore デバッグ用なので無視
     props.push({ key, value: obj[key] });
   }
   return `<${obj.constructor.name} ${props
@@ -231,7 +232,7 @@ class SectionParser {
 }
 
 abstract class Syntax {
-  type: TypeValue;
+  type: TypeValue | undefined = undefined;
 
   abstract eval(env: Environment): LValue;
   abstract typeEval(env: Environment): TypeValue;
@@ -298,7 +299,7 @@ class FnDefSyntax extends Syntax {
     });
 
     const retBody = this.body.reduce(
-      (_: TypeValue, x: Syntax): TypeValue => x.typeEval(env),
+      (_, x) => x.typeEval(env),
       env.buildinType.Null,
     );
 
@@ -332,18 +333,13 @@ class FnDefSyntax extends Syntax {
   }
 }
 
-class FnArgSyntax extends Syntax {
+class FnArgSyntax {
   name: Token;
   fieldType: TypeSyntax;
 
   constructor(name: Token, type: TypeSyntax) {
-    super();
     this.name = name;
     this.fieldType = type;
-  }
-
-  typeEval(_env: Environment): TypeValue {
-    throw new Error(`never`);
   }
 
   eval(env: Environment): FnArgValue {
@@ -570,7 +566,8 @@ class StructFieldCallSyntax extends Syntax {
 
     const ss = f.fieldType;
     if (this.child instanceof Token) {
-      const ff = ss.fields.find((x) => x.name === this.child.text);
+      // LSP のバグっぽいため as をつけている
+      const ff = ss.fields.find((x) => x.name === (this.child as Token).text);
       if (!ff) {
         throw new Error(
           `${this.child.text}は構造体のフィールド名ではありません。token=${this.child}`,
@@ -680,6 +677,8 @@ abstract class TypeSyntax extends Syntax {
     super();
     this.name = name;
   }
+
+  abstract eval(env: Environment): TypeValue;
 }
 
 class PrimitiveTypeSyntax extends TypeSyntax {
@@ -817,30 +816,28 @@ class IfSyntax extends Syntax {
   typeEval(env: Environment): TypeValue {
     this.condition.typeEval(env);
 
+    env.compileScope.create();
     const thenType = this.thenClause.reduce(
-      (_: TypeValue, x: Syntax): TypeValue => x.typeEval(env),
+      (_, x) => x.typeEval(env),
       env.buildinType.Null,
     );
+    env.compileScope.delete();
 
     let elseType: TypeValue | undefined = undefined;
     if (this.elseClause !== undefined) {
+      env.compileScope.create();
       elseType = this.elseClause.reduce(
-        (_: TypeValue, x: Syntax): TypeValue => x.typeEval(env),
+        (_, x) => x.typeEval(env),
         env.buildinType.Null,
       );
+      env.compileScope.delete();
     }
 
     if (elseType === undefined) {
       this.type = thenType;
       return this.type;
     } else {
-      if (equalType(thenType, elseType)) {
-        this.type = thenType;
-        return this.type;
-      } else {
-        this.type = new OrTypeValue([thenType, elseType]);
-        return this.type;
-      }
+      return OrTypeValue.create([thenType, elseType]);
     }
   }
 
@@ -855,18 +852,18 @@ class IfSyntax extends Syntax {
       if (this.elseClause === undefined) {
         return LNull;
       } else {
-        return this.elseClause.reduce(
-          (_: LValue, x: Syntax): LValue => x.eval(env),
-          LNull,
-        );
+        env.scope.create();
+        const result = this.elseClause.reduce((_, x) => x.eval(env), LNull);
+        env.scope.delete();
+        return result;
       }
     }
 
     // true の時
-    return this.thenClause.reduce(
-      (_: LValue, x: Syntax): LValue => x.eval(env),
-      LNull,
-    );
+    env.scope.create();
+    const result = this.thenClause.reduce((_, x) => x.eval(env), LNull);
+    env.scope.delete();
+    return result;
   }
 }
 
@@ -882,10 +879,9 @@ class MatchSyntax extends Syntax {
     this.elseBody = e;
   }
 
-  typeEval(env: Environment): OrTypeValue {
-    // 変数部分の処理。元々の型を記録しておく
-    const originVariable = env.compileScope.get(this.variable.text);
-    if (!originVariable) {
+  typeEval(env: Environment): TypeValue {
+    const v = env.compileScope.get(this.variable.text);
+    if (!v) {
       throw new Error(
         `${this.variable.text}は見つかりません。token=${this.variable}`,
       );
@@ -895,42 +891,67 @@ class MatchSyntax extends Syntax {
     const resultTypes: TypeValue[] = [];
 
     this.sets.forEach((x) => {
-      env.compileScope.set(this.variable.text, x.matchType.typeEval(env));
+      env.compileScope.create();
+      env.compileScope.set(this.variable.text, x.type.typeEval(env));
       const type = x.body.reduce(
-        (_: TypeValue, x: Syntax): TypeValue => x.typeEval(env),
+        (_, x) => x.typeEval(env),
         env.buildinType.Null,
       );
       resultTypes.push(type);
+      env.compileScope.delete();
     });
-
-    // 変数部分の型を元に戻す
-    env.compileScope.set(this.variable.text, originVariable);
 
     // else 部分の処理
     if (this.elseBody !== undefined) {
+      env.compileScope.create();
       const elseType = this.elseBody.reduce(
-        (_: TypeValue, x: Syntax): TypeValue => x.typeEval(env),
+        (_, x) => x.typeEval(env),
         env.buildinType.Null,
       );
       resultTypes.push(elseType);
+      env.compileScope.delete();
     } else {
       resultTypes.push(env.buildinType.Null);
     }
 
-    const result = new OrTypeValue(uniqueType(resultTypes));
-    this.type = result;
-    return result;
+    this.type = OrTypeValue.create(resultTypes);
+    return this.type;
   }
 
-  eval(env: Environment): LValue {}
+  eval(env: Environment): LValue {
+    const v = env.scope.get(this.variable.text);
+    if (!v) {
+      throw new Error(
+        `${this.variable.text}は見つかりません。token=${this.variable}`,
+      );
+    }
+
+    for (const set of this.sets) {
+      if (equalType(set.type.eval(env), v.toType())) {
+        env.scope.create();
+        const result = set.body.reduce((_, x) => x.eval(env), LNull);
+        env.scope.delete();
+        return result;
+      }
+    }
+
+    if (this.elseBody !== undefined) {
+      env.scope.create();
+      const result = this.elseBody.reduce((_, x) => x.eval(env), LNull);
+      env.scope.delete();
+      return result;
+    } else {
+      return LNull;
+    }
+  }
 }
 
 class MatchSet {
-  matchType: TypeSyntax;
+  type: TypeSyntax;
   body: Syntax[];
 
   constructor(m: TypeSyntax, b: Syntax[]) {
-    this.matchType = m;
+    this.type = m;
     this.body = b;
   }
 }
@@ -1287,6 +1308,7 @@ class SyntaxParser {
     const thenSyntaxs = new SyntaxParser(thenSections).run();
 
     // else 部分の処理
+    // @ts-ignore maybe a bug in LSP
     if (tokens[0].text !== "{") return new IfSyntax(condition, thenSyntaxs);
 
     start = tokens.shift();
@@ -1336,6 +1358,7 @@ class SyntaxParser {
       sets.push(new MatchSet(matchType, bodySyntaxs));
 
       if (tokens[0] === undefined) break;
+      // @ts-ignore maybe a bug in LSP
       if (tokens[0].text === "else") break;
     }
 
@@ -1407,23 +1430,358 @@ class SyntaxParser {
   }
 }
 
-class TypeParser {
-  syntaxs: Syntax[];
-  env: Environment;
+function typeParser(syntaxs: Syntax[], env: Environment): Syntax[] {
+  syntaxs.forEach((x) => x.typeEval(env));
+  return syntaxs;
+}
 
-  constructor(syntaxs: Syntax[], env: Environment) {
-    this.syntaxs = syntaxs;
-    this.env = env;
+const enum PrimitiveType {
+  Any = "Any",
+  Type = "Type",
+  Num = "Num",
+  Bool = "Bool",
+  Null = "Null",
+}
+
+abstract class LValue {
+  toString(): string {
+    return dumpObj(this);
   }
 
-  run(): Syntax[] {
-    this.syntaxs.forEach((x) => {
-      x.typeEval(this.env);
-    });
+  abstract toType(): TypeValue;
+}
 
-    return this.syntaxs;
+class NullValue extends LValue {
+  toType(): PrimitiveTypeValue {
+    return BUILDIN_TYPES.Null;
   }
 }
+const LNull = new NullValue();
+
+class BoolValue extends LValue {
+  value: boolean;
+
+  constructor(value: boolean) {
+    super();
+    this.value = value;
+  }
+
+  toType(): PrimitiveTypeValue {
+    return BUILDIN_TYPES.Bool;
+  }
+}
+
+class NumValue extends LValue {
+  value: number;
+
+  constructor(value: number) {
+    super();
+    this.value = value;
+  }
+
+  toType(): PrimitiveTypeValue {
+    return BUILDIN_TYPES.Num;
+  }
+}
+
+abstract class TypeValue extends LValue {
+  primitive: PrimitiveType;
+
+  constructor(p: PrimitiveType) {
+    super();
+    this.primitive = p;
+  }
+
+  abstract equalType(other: TypeValue): boolean;
+}
+
+abstract class ConstructorTypeValue extends TypeValue {
+  abstract createInstance(args: LValue[]): LValue;
+}
+
+abstract class GenericTypeValue extends TypeValue {
+  abstract createType(args: TypeValue[]): ConstructorTypeValue;
+}
+
+class PrimitiveTypeValue extends TypeValue {
+  equalType(other: PrimitiveTypeValue): boolean {
+    if (other.constructor !== PrimitiveTypeValue) {
+      throw new Error(`type が揃っていません。other = ${other} `);
+    }
+    return this.primitive === other.primitive;
+  }
+
+  toType(): PrimitiveTypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class FnTypeValue extends TypeValue {
+  args: TypeValue[];
+  returnType: TypeValue;
+
+  constructor(args: TypeValue[], returnType: TypeValue) {
+    super(PrimitiveType.Type);
+    this.args = args;
+    this.returnType = returnType;
+  }
+
+  equalType(other: FnTypeValue): boolean {
+    if (other.constructor !== FnTypeValue) {
+      throw new Error(`type が揃っていません。other = ${other} `);
+    }
+
+    if (!equalType(this.returnType, other.returnType)) return false;
+
+    return equalType(this.args, other.args);
+  }
+
+  toType(): PrimitiveTypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class StructTypeValue extends ConstructorTypeValue {
+  fields: StructFieldValue[];
+
+  constructor(fields: StructFieldValue[]) {
+    super(PrimitiveType.Type);
+    this.fields = fields;
+  }
+
+  createInstance(args: LValue[]): StructInstanceValue {
+    const map: Map<string, LValue> = new Map();
+
+    this.fields.forEach((x, i) => {
+      const value = args[i] ?? LNull;
+      map.set(x.name, value);
+    });
+
+    return new StructInstanceValue(this.fields, map);
+  }
+
+  equalType(other: StructTypeValue): boolean {
+    if (other.constructor !== StructTypeValue) {
+      throw new Error(`type が揃っていません。other = ${other} `);
+    }
+
+    return equalType(
+      this.fields.map((x) => x.fieldType),
+      other.fields.map((x) => x.fieldType),
+    );
+  }
+
+  toType(): PrimitiveTypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class StructInstanceValue extends LValue {
+  fields: StructFieldValue[];
+  map: Map<string, LValue>;
+
+  constructor(fields: StructFieldValue[], map: Map<string, LValue>) {
+    super();
+    this.fields = fields;
+    this.map = map;
+  }
+
+  get(key: string): LValue {
+    const result = this.map.get(key);
+    if (!result) {
+      throw new Error(`${key} は存在しないフィールドです。struct = ${this} `);
+    }
+    return result;
+  }
+
+  toType(): StructTypeValue {
+    return new StructTypeValue(this.fields);
+  }
+}
+
+class StructFieldValue {
+  name: string;
+  fieldType: TypeValue;
+
+  constructor(name: string, fieldType: TypeValue) {
+    this.name = name;
+    this.fieldType = fieldType;
+  }
+}
+
+class OrGenericTypeValue extends GenericTypeValue {
+  constructor() {
+    super(PrimitiveType.Type);
+  }
+
+  createType(args: TypeValue[]): OrTypeValue {
+    return new OrTypeValue(args);
+  }
+
+  equalType(other: OrGenericTypeValue): boolean {
+    return other.constructor === OrGenericTypeValue;
+  }
+
+  toType(): PrimitiveTypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class OrTypeValue extends ConstructorTypeValue {
+  static create(types: TypeValue[]): TypeValue {
+    const t = uniqueType(types);
+    if (t.length === 0) {
+      return BUILDIN_TYPES.Null;
+    } else if (t.length === 1) {
+      return t[0];
+    } else {
+      return new OrTypeValue(t);
+    }
+  }
+
+  types: TypeValue[];
+
+  constructor(types: TypeValue[]) {
+    super(PrimitiveType.Type);
+    if (types.length < 2) {
+      throw new Error(`Orには二つ以上のデータ型が必要です。args = ${types} `);
+    }
+    if (types.length !== uniqueType(types).length) {
+      throw new Error(`データ型が重複しています。types=${types}`);
+    }
+    this.types = types;
+  }
+
+  createInstance(args: LValue[]): OrInstanceValue {
+    if (args.length !== 1) {
+      throw new Error(`Orには一つ以上のデータ型が必要です。args = ${args} `);
+    }
+
+    const types: TypeValue[] = [];
+    for (const arg of args) {
+      if (arg instanceof TypeValue) {
+        types.push(arg);
+      } else {
+        throw new Error(`引数はデータ型のみです。`);
+      }
+    }
+
+    if (types.length !== uniqueType(types).length) {
+      throw new Error(`データ型が重複しています。types=${types}`);
+    }
+
+    return new OrInstanceValue(args[0], this);
+  }
+
+  equalType(other: OrTypeValue): boolean {
+    if (other.constructor !== OrTypeValue) return false;
+    return equalType(this.types, other.types);
+  }
+
+  toType(): PrimitiveTypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class OrInstanceValue extends LValue {
+  value: LValue;
+  type: OrTypeValue;
+
+  constructor(value: LValue, type: OrTypeValue) {
+    super();
+    this.value = value;
+    this.type = type;
+  }
+
+  toType(): OrTypeValue {
+    return this.type;
+  }
+}
+
+class FnArgValue {
+  name: string;
+  type: TypeValue;
+
+  constructor(name: string, type: TypeValue) {
+    this.name = name;
+    this.type = type;
+  }
+}
+
+abstract class FnValue extends LValue {
+  defArgs: FnArgValue[];
+  returnType: TypeValue;
+
+  constructor(d: FnArgValue[], r: TypeValue) {
+    super();
+    this.defArgs = d;
+    this.returnType = r;
+  }
+
+  toType(): FnTypeValue {
+    return new FnTypeValue(
+      this.defArgs.map((x) => x.type),
+      this.returnType,
+    );
+  }
+
+  abstract call(env: Environment, args: LValue[]): LValue;
+}
+
+class FnBuildinValue extends FnValue {
+  body: (...args: LValue[]) => LValue;
+
+  constructor(
+    args: FnArgValue[],
+    returnType: TypeValue,
+    body: (...args: LValue[]) => LValue,
+  ) {
+    super(args, returnType);
+    this.body = body;
+  }
+
+  call(_env: Environment, args: LValue[]): LValue {
+    return this.body(...args);
+  }
+}
+
+class FnUserValue extends FnValue {
+  body: Syntax[];
+
+  constructor(args: FnArgValue[], returnType: TypeValue, body: Syntax[]) {
+    super(args, returnType);
+    this.body = body;
+  }
+
+  call(env: Environment, actualArgs: LValue[]): LValue {
+    env.scope.create();
+
+    // 引数を設定
+    actualArgs.forEach((actualArg, i) => {
+      const defArg = this.defArgs[i];
+      env.scope.set(defArg.name, actualArg);
+    });
+
+    // 関数のボディを実行
+    let result = LNull;
+    this.body.forEach((line) => {
+      result = line.eval(env);
+    });
+
+    env.scope.delete();
+
+    return result;
+  }
+}
+
+const BUILDIN_TYPES = {
+  Num: new PrimitiveTypeValue(PrimitiveType.Num),
+  Bool: new PrimitiveTypeValue(PrimitiveType.Bool),
+  Null: new PrimitiveTypeValue(PrimitiveType.Null),
+  Any: new PrimitiveTypeValue(PrimitiveType.Any),
+  Type: new PrimitiveTypeValue(PrimitiveType.Type),
+  Or: new OrGenericTypeValue(),
+};
 
 class Environment {
   scope: Scope<LValue>;
@@ -1435,22 +1793,29 @@ class Environment {
     this.scope = new Scope();
     this.compileScope = new Scope();
 
-    this.buildinType = {
-      Num: new PrimitiveTypeValue(PrimitiveType.Num),
-      Bool: new PrimitiveTypeValue(PrimitiveType.Bool),
-      Null: new PrimitiveTypeValue(PrimitiveType.Null),
-      Any: new PrimitiveTypeValue(PrimitiveType.Any),
-      Type: new PrimitiveTypeValue(PrimitiveType.Type),
-      Or: new OrGenericTypeValue(),
-    };
+    this.buildinType = BUILDIN_TYPES;
 
     this.buildinFn = {
       print: new FnBuildinValue(
         [new FnArgValue("arg", this.buildinType.Any)],
         this.buildinType.Null,
-        (...args: any[]) => {
+        (...args: LValue[]) => {
           console.log(...args);
           return LNull;
+        },
+      ),
+      add: new FnBuildinValue(
+        [
+          new FnArgValue("a", this.buildinType.Num),
+          new FnArgValue("b", this.buildinType.Num),
+        ],
+        this.buildinType.Num,
+        (...args) => {
+          const ret = args.reduce((acc, x) => {
+            if (!(x instanceof NumValue)) throw new Error(`never`);
+            return acc + x.value;
+          }, 0);
+          return new NumValue(ret);
         },
       ),
     };
@@ -1536,290 +1901,8 @@ class ScopeCore<T> {
   }
 }
 
-const enum PrimitiveType {
-  Any = "Any",
-  Type = "Type",
-  Num = "Num",
-  Bool = "Bool",
-  Null = "Null",
-}
-
-abstract class LValue {
-  toString(): string {
-    return dumpObj(this);
-  }
-}
-
-class NullValue extends LValue {}
-const LNull = new NullValue();
-
-class BoolValue extends LValue {
-  value: boolean;
-
-  constructor(value: boolean) {
-    super();
-    this.value = value;
-  }
-}
-
-class NumValue extends LValue {
-  value: number;
-
-  constructor(value: number) {
-    super();
-    this.value = value;
-  }
-}
-
-abstract class TypeValue extends LValue {
-  primitive: PrimitiveType;
-
-  constructor(p: PrimitiveType) {
-    super();
-    this.primitive = p;
-  }
-
-  abstract equalType(other: TypeValue): boolean;
-}
-
-abstract class ConstructorTypeValue extends TypeValue {
-  abstract createInstance(args: LValue[]): LValue;
-}
-
-abstract class GenericTypeValue extends TypeValue {
-  abstract createType(args: TypeValue[]): ConstructorTypeValue;
-}
-
-class PrimitiveTypeValue extends TypeValue {
-  equalType(other: PrimitiveTypeValue): boolean {
-    if (other.constructor !== PrimitiveTypeValue) {
-      throw new Error(`type が揃っていません。other = ${other} `);
-    }
-    return this.primitive === other.primitive;
-  }
-}
-
-class FnTypeValue extends TypeValue {
-  args: TypeValue[];
-  returnType: TypeValue;
-
-  constructor(args: TypeValue[], returnType: TypeValue) {
-    super(PrimitiveType.Type);
-    this.args = args;
-    this.returnType = returnType;
-  }
-
-  equalType(other: FnTypeValue): boolean {
-    if (other.constructor !== FnTypeValue) {
-      throw new Error(`type が揃っていません。other = ${other} `);
-    }
-
-    if (!equalType(this.returnType, other.returnType)) return false;
-
-    return equalType(this.args, other.args);
-  }
-}
-
-class StructTypeValue extends ConstructorTypeValue {
-  fields: StructFieldValue[];
-
-  constructor(fields: StructFieldValue[]) {
-    super(PrimitiveType.Type);
-    this.fields = fields;
-  }
-
-  createInstance(args: LValue[]): StructInstanceValue {
-    const map: Map<string, LValue> = new Map();
-
-    this.fields.forEach((x, i) => {
-      const value = args[i] ?? LNull;
-      map.set(x.name, value);
-    });
-
-    return new StructInstanceValue(this.fields, map);
-  }
-
-  equalType(other: StructTypeValue): boolean {
-    if (other.constructor !== StructTypeValue) {
-      throw new Error(`type が揃っていません。other = ${other} `);
-    }
-
-    return equalType(
-      this.fields.map((x) => x.fieldType),
-      other.fields.map((x) => x.fieldType),
-    );
-  }
-}
-
-class StructInstanceValue extends LValue {
-  fields: StructFieldValue[];
-  map: Map<string, LValue>;
-
-  constructor(fields: StructFieldValue[], map: Map<string, LValue>) {
-    super();
-    this.fields = fields;
-    this.map = map;
-  }
-
-  get(key: string): LValue {
-    const result = this.map.get(key);
-    if (!result) {
-      throw new Error(`${key} は存在しないフィールドです。struct = ${this} `);
-    }
-    return result;
-  }
-}
-
-class StructFieldValue {
-  name: string;
-  fieldType: TypeValue;
-
-  constructor(name: string, fieldType: TypeValue) {
-    this.name = name;
-    this.fieldType = fieldType;
-  }
-}
-
-class OrGenericTypeValue extends GenericTypeValue {
-  constructor() {
-    super(PrimitiveType.Type);
-  }
-
-  createType(args: TypeValue[]): OrTypeValue {
-    return new OrTypeValue(args);
-  }
-
-  equalType(other: OrGenericTypeValue): boolean {
-    return other.constructor === OrGenericTypeValue;
-  }
-}
-
-class OrTypeValue extends ConstructorTypeValue {
-  types: TypeValue[];
-
-  constructor(types: TypeValue[]) {
-    super(PrimitiveType.Type);
-    this.types = types;
-  }
-
-  createInstance(args: LValue[]): OrInstanceValue {
-    if (args.length !== 1) {
-      throw new Error(`Orには値を一つしか入れられません。args = ${args} `);
-    }
-    // todo: 重複チェック
-    return new OrInstanceValue(args[0], this.types);
-  }
-
-  equalType(other: OrTypeValue): boolean {
-    if (other.constructor !== OrTypeValue) return false;
-    return equalType(this.types, other.types);
-  }
-}
-
-class OrInstanceValue extends LValue {
-  value: LValue;
-  types: TypeValue[];
-
-  constructor(value: LValue, types: TypeValue[]) {
-    super();
-    this.value = value;
-    this.types = types;
-  }
-}
-
-class FnArgValue {
-  name: string;
-  type: TypeValue;
-
-  constructor(name: string, type: TypeValue) {
-    this.name = name;
-    this.type = type;
-  }
-}
-
-abstract class FnValue extends LValue {
-  defArgs: FnArgValue[];
-  returnType: TypeValue;
-
-  abstract call(env: Environment, args: LValue[]): LValue;
-}
-
-class FnBuildinValue extends FnValue {
-  body: Function;
-
-  constructor(
-    args: FnArgValue[],
-    returnType: TypeValue,
-    body: (...args: any[]) => LValue,
-  ) {
-    super();
-    this.defArgs = args;
-    this.returnType = returnType;
-    this.body = body;
-  }
-
-  call(_env: Environment, args: LValue[]): LValue {
-    return this.body(...args);
-  }
-
-  toType(): FnTypeValue {
-    return new FnTypeValue(
-      this.defArgs.map((x) => x.type),
-      this.returnType,
-    );
-  }
-}
-
-class FnUserValue extends FnValue {
-  body: Syntax[];
-
-  constructor(args: FnArgValue[], returnType: TypeValue, body: Syntax[]) {
-    super();
-    this.defArgs = args;
-    this.returnType = returnType;
-    this.body = body;
-  }
-
-  call(env: Environment, actualArgs: LValue[]): LValue {
-    env.scope.create();
-
-    // 引数を設定
-    actualArgs.forEach((actualArg, i) => {
-      const defArg = this.defArgs[i];
-      env.scope.set(defArg.name, actualArg);
-    });
-
-    // 関数のボディを実行
-    let result = LNull;
-    this.body.forEach((line) => {
-      result = line.eval(env);
-    });
-
-    env.scope.delete();
-
-    return result;
-  }
-}
-
 function evaler(syntaxs: Syntax[], env: Environment): Environment {
   syntaxs.forEach((x) => x.eval(env));
 
   return env;
 }
-
-interprete(`
-           match Num Num {
-             1
-           } Type {
-             Or
-           } else {
-             true
-           }
-`);
-
-/*
-match Num Num {print 1}
-match Num Num {print 1} Bool {print 2} Type {print 3}
-match Num Num {print 1} Bool {print 2} else {print 3}
-(match Num Num {print 1} Type {print 2})
-*/
