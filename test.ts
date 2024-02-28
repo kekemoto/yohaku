@@ -1,13 +1,9 @@
 import { interprete } from "./interpreter.ts";
 
 interprete(`
-           a = if true { b = 1 } { b = null }
+           a = if false { 1 } { null }
 
-           c = match a Num {
-             d = 1
-           } else {
-             d = 2
+           c = match a { Num x { print (add x 1) } Null a { print a }
+             else a { print 3 }
            }
-
-           print c
 `);

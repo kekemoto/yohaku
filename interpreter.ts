@@ -32,6 +32,17 @@ function dumpObj(obj: object): string {
     .join(", ")}>`;
 }
 
+function skip<T>(list: T[], f: (x: T) => boolean): T[] {
+  const item = list[0];
+  if (item === undefined) return list;
+  if (f(item)) {
+    list.shift();
+    return skip(list, f);
+  } else {
+    return list;
+  }
+}
+
 function equalType(
   a: TypeValue | TypeValue[],
   b: TypeValue | TypeValue[],
@@ -868,32 +879,27 @@ class IfSyntax extends Syntax {
 }
 
 class MatchSyntax extends Syntax {
-  variable: Token;
-  sets: MatchSet[];
-  elseBody: Syntax[] | undefined;
+  variable: Syntax;
+  cases: MatchCase[];
+  elseCase: MatchElseCase | undefined;
 
-  constructor(v: Token, s: MatchSet[], e?: Syntax[]) {
+  constructor(v: Syntax, c: MatchCase[], e: MatchElseCase | undefined) {
     super();
     this.variable = v;
-    this.sets = s;
-    this.elseBody = e;
+    this.cases = c;
+    this.elseCase = e;
   }
 
   typeEval(env: Environment): TypeValue {
-    const v = env.compileScope.get(this.variable.text);
-    if (!v) {
-      throw new Error(
-        `${this.variable.text}は見つかりません。token=${this.variable}`,
-      );
-    }
+    const originType = this.variable.typeEval(env);
 
     // sets の処理
     const resultTypes: TypeValue[] = [];
 
-    this.sets.forEach((x) => {
+    this.cases.forEach((c) => {
       env.compileScope.create();
-      env.compileScope.set(this.variable.text, x.type.typeEval(env));
-      const type = x.body.reduce(
+      env.compileScope.set(c.arg.text, c.type.typeEval(env));
+      const type = c.body.reduce(
         (_, x) => x.typeEval(env),
         env.buildinType.Null,
       );
@@ -902,9 +908,10 @@ class MatchSyntax extends Syntax {
     });
 
     // else 部分の処理
-    if (this.elseBody !== undefined) {
+    if (this.elseCase !== undefined) {
       env.compileScope.create();
-      const elseType = this.elseBody.reduce(
+      env.compileScope.set(this.elseCase.arg.text, originType);
+      const elseType = this.elseCase.body.reduce(
         (_, x) => x.typeEval(env),
         env.buildinType.Null,
       );
@@ -919,25 +926,22 @@ class MatchSyntax extends Syntax {
   }
 
   eval(env: Environment): LValue {
-    const v = env.scope.get(this.variable.text);
-    if (!v) {
-      throw new Error(
-        `${this.variable.text}は見つかりません。token=${this.variable}`,
-      );
-    }
+    const v = this.variable.eval(env);
 
-    for (const set of this.sets) {
-      if (equalType(set.type.eval(env), v.toType())) {
+    for (const c of this.cases) {
+      if (equalType(c.type.eval(env), v.toType())) {
         env.scope.create();
-        const result = set.body.reduce((_, x) => x.eval(env), LNull);
+        env.scope.set(c.arg.text, v);
+        const result = c.body.reduce((_, x) => x.eval(env), LNull);
         env.scope.delete();
         return result;
       }
     }
 
-    if (this.elseBody !== undefined) {
+    if (this.elseCase !== undefined) {
       env.scope.create();
-      const result = this.elseBody.reduce((_, x) => x.eval(env), LNull);
+      env.scope.set(this.elseCase.arg.text, v);
+      const result = this.elseCase.body.reduce((_, x) => x.eval(env), LNull);
       env.scope.delete();
       return result;
     } else {
@@ -946,12 +950,24 @@ class MatchSyntax extends Syntax {
   }
 }
 
-class MatchSet {
+class MatchCase {
   type: TypeSyntax;
+  arg: Token;
   body: Syntax[];
 
-  constructor(m: TypeSyntax, b: Syntax[]) {
-    this.type = m;
+  constructor(t: TypeSyntax, a: Token, b: Syntax[]) {
+    this.type = t;
+    this.arg = a;
+    this.body = b;
+  }
+}
+
+class MatchElseCase {
+  arg: Token;
+  body: Syntax[];
+
+  constructor(a: Token, b: Syntax[]) {
+    this.arg = a;
     this.body = b;
   }
 }
@@ -1268,6 +1284,8 @@ class SyntaxParser {
 
     const fields: StructFieldSyntax[] = [];
     for (;;) {
+      skip(tokens, (x) => x.text === "\n");
+
       const token = tokens[0];
       if (!token) throw new Error(`}で閉じる必要があります。tokens=${tokens}`);
       if (token.text === "}") break;
@@ -1329,63 +1347,68 @@ class SyntaxParser {
     if (MATCH !== tokens[0].text) return undefined;
     tokens.shift();
 
-    const variable = tokens.shift();
-    if (!variable) throw new Error(`変数名が必須です。`);
-    if (!variable.isVariable()) {
-      throw new Error(`変数名として不適切です。token=${variable}`);
-    }
+    const value = this.oneValueParse(tokens);
 
-    const sets: MatchSet[] = [];
+    const start = tokens.shift();
+    if (start === undefined) throw new Error(`{で始まる必要があります`);
+    if (start.text !== "{") {
+      throw new Error(`{で始まる必要があります。token=${start}`);
+    }
+    const cases: MatchCase[] = [];
+    let elseCase: MatchElseCase | undefined = undefined;
     for (;;) {
-      const matchType = this.typeParse(tokens);
-
-      const start = tokens.shift();
-      if (!start) throw new Error(`{があるべきです。`);
-      if (start.text !== "{") {
-        throw new Error(`{であるべきです。token=${start}`);
+      skip(tokens, (x) => x.text === "\n");
+      const token = tokens[0];
+      if (token === undefined) throw new Error(`}で閉じる必要があります。`);
+      if (token.text === "}") {
+        tokens.shift();
+        break;
       }
 
+      // データ型部分の処理
+      let t: Token | TypeSyntax;
+      if (token.text === "else") {
+        t = token;
+        tokens.shift();
+      } else {
+        t = this.typeParse(tokens);
+      }
+
+      // 引数部分の処理
+      const v = tokens.shift();
+      if (v === undefined) throw new Error(`変数名である必要があります。`);
+      if (!v.isVariable()) {
+        throw new Error(`変数名として不適切です。token=${v}`);
+      }
+
+      // body 部分の処理
+      const start = tokens.shift();
+      if (start === undefined) throw new Error(`{で始まる必要があります。`);
+      if (start.text !== "{") {
+        throw new Error(`{で始まる必要があります。token=${start}`);
+      }
       const bodyTokens: Token[] = [];
       for (;;) {
-        const token = tokens.shift();
-        if (!token) throw new Error(`}で閉じる必要があります。token=${start}`);
-        if (token.text === "}") break;
-        bodyTokens.push(token);
+        const t = tokens.shift();
+        if (t === undefined) throw new Error(`}で閉じる必要があります。`);
+        if (t.text === "}") break;
+        bodyTokens.push(t);
       }
-      const bodySections = new SectionParser(bodyTokens).run();
-      const bodySyntaxs = new SyntaxParser(bodySections).run();
+      const bodySyntaxs = new SyntaxParser(
+        new SectionParser(bodyTokens).run(),
+      ).run();
 
-      sets.push(new MatchSet(matchType, bodySyntaxs));
-
-      if (tokens[0] === undefined) break;
-      // @ts-ignore maybe a bug in LSP
-      if (tokens[0].text === "else") break;
+      if (t instanceof TypeSyntax) {
+        cases.push(new MatchCase(t, v, bodySyntaxs));
+      } else {
+        if (elseCase !== undefined) {
+          throw new Error(`else が２回定義されてしまっています。token=${t}`);
+        }
+        elseCase = new MatchElseCase(v, bodySyntaxs);
+      }
     }
 
-    if (tokens[0] === undefined) {
-      return new MatchSyntax(variable, sets);
-    } else {
-      tokens.shift();
-
-      const start = tokens.shift();
-      if (!start) throw new Error(`{があるべきです。`);
-      if (start.text !== "{") {
-        throw new Error(`{であるべきです。token=${start}`);
-      }
-
-      const bodyTokens: Token[] = [];
-      for (;;) {
-        const token = tokens.shift();
-        if (!token) throw new Error(`}で閉じる必要があります。token=${start}`);
-        if (token.text === "}") break;
-        bodyTokens.push(token);
-      }
-      tokens.shift();
-      const bodySections = new SectionParser(bodyTokens).run();
-      const bodySyntaxs = new SyntaxParser(bodySections).run();
-
-      return new MatchSyntax(variable, sets, bodySyntaxs);
-    }
+    return new MatchSyntax(value, cases, elseCase);
   }
 
   nullParse(tokens: Token[]): NullSyntax | undefined {
