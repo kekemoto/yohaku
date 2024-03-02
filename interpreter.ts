@@ -16,7 +16,6 @@ export function interprete(text: string, env?: Environment): Environment {
   env = env ?? new Environment();
 
   syntaxs = typeParser(syntaxs, env);
-  console.dir(syntaxs, { depth: 10 });
   env = evaler(syntaxs, env);
   return env;
 }
@@ -30,6 +29,10 @@ function dumpObj(obj: object): string {
   return `<${obj.constructor.name} ${props
     .map((x) => `${x.key}: ${x.value}`)
     .join(", ")}>`;
+}
+
+function never(): never {
+  throw new Error(`never`);
 }
 
 function skip<T>(list: T[], f: (x: T) => boolean): T[] {
@@ -264,27 +267,41 @@ class VarDefSyntax extends Syntax {
   }
 
   typeEval(env: Environment): TypeValue {
-    if (env.compileScope.has(this.name.text)) {
-      throw new Error(
-        `${this.name.text}は既に定義されています。token=${this.name}`,
-      );
+    const name = env.compileScope.get(this.name.text);
+    const value = this.value.typeEval(env);
+
+    if (name === undefined) {
+      env.compileScope.set(this.name.text, value);
+      this.type = value;
+      return value;
     }
 
-    this.type = this.value.typeEval(env);
-    env.compileScope.set(this.name.text, this.type);
-    return this.type;
+    if (name instanceof FnList && value instanceof FnTypeValue) {
+      env.compileScope.set(this.name.text, value);
+      this.type = value;
+      return value;
+    }
+
+    throw new Error(
+      `${this.name.text}は既に定義されています。token=${this.name}`,
+    );
   }
 
   eval(env: Environment): LValue {
+    const name = env.scope.get(this.name.text);
     const value = this.value.eval(env);
 
-    if (env.scope.has(this.name.text)) {
-      throw new Error(`既に${this.name.text}は定義されているため使えません。`);
+    if (name === undefined) {
+      env.scope.set(this.name.text, value);
+      return value;
     }
 
-    env.scope.set(this.name.text, value);
+    if (name instanceof FnList && value instanceof FnValue) {
+      env.scope.set(this.name.text, value);
+      return value;
+    }
 
-    return value;
+    throw new Error(`既に${this.name.text}は定義されているため使えません。`);
   }
 }
 
@@ -375,49 +392,29 @@ class FnCallSyntax extends Syntax {
   }
 
   typeEval(env: Environment): TypeValue {
-    const f = env.compileScope.get(this.name.text);
-    if (!f) throw new Error(`関数が見つかりません。token=${this.name}`);
+    const v = env.compileScope.get(this.name.text);
+    if (!v) throw new Error(`関数が見つかりません。token=${this.name}`);
 
     const argTypes = this.args.map((x) => x.typeEval(env));
 
-    if (f instanceof FnTypeValue) {
-      if (argTypes.length !== f.args.length) {
-        throw new Error(`引数の数が一致しません。token=${this.name}`);
-      }
-      for (let i = 0; i < argTypes.length; i++) {
-        const define = f.args[i];
-        const actual = argTypes[i];
-
-        if (define.primitive === PrimitiveType.Any) continue;
-
-        if (actual.primitive === PrimitiveType.Any) {
-          throw new Error(
-            `${this.name}の${
-              i + 1
-            }番目の引数が${PrimitiveType.Any}型になっています。`,
-          );
-        }
-
-        if (!equalType(define, actual)) {
-          throw new Error(
-            `${this.name}の${
-              i + 1
-            }番目の引数の型が一致しません。define=${define}, actual=${actual}`,
-          );
-        }
-      }
+    if (v instanceof FnList) {
+      const f = v.findType(this.args.map((x) => x.typeEval(env)));
+      if (f === undefined)
+        throw new Error(
+          `${this.name.text}関数が見つかりませんでした。token=${this.name}`,
+        );
 
       this.type = f.returnType;
+      return f.returnType;
+    }
+
+    if (v instanceof StructTypeValue) {
+      this.type = v;
       return this.type;
     }
 
-    if (f instanceof StructTypeValue) {
-      this.type = f;
-      return this.type;
-    }
-
-    if (f instanceof GenericTypeValue) {
-      this.type = f.createType(argTypes);
+    if (v instanceof GenericTypeValue) {
+      this.type = v.createType(argTypes);
       return this.type;
     }
 
@@ -425,28 +422,27 @@ class FnCallSyntax extends Syntax {
   }
 
   eval(env: Environment): LValue {
-    const f = env.scope.get(this.name.text);
-    if (!f) throw new Error(`関数が見つかりません。token=${this.name}`);
+    const v = env.scope.get(this.name.text);
+    if (!v) throw new Error(`関数が見つかりません。token=${this.name}`);
 
-    if (f instanceof FnValue) {
-      if (this.args.length !== f.defArgs.length) {
+    if (v instanceof FnList) {
+      const args = this.args.map((x) => x.eval(env));
+
+      const f = v.findValue(args.map((x) => x.toType()));
+      if (f === undefined)
         throw new Error(
-          `引数の数があっていません。function=${f}, args=${this.args}`,
+          `${this.name.text}関数が見つかりませんでした。token=${this.name}`,
         );
-      }
 
-      return f.call(
-        env,
-        this.args.map((x) => x.eval(env)),
-      );
+      return f.call(env, args);
     }
 
-    if (f instanceof StructTypeValue) {
-      return f.createInstance(this.args.map((x) => x.eval(env)));
+    if (v instanceof StructTypeValue) {
+      return v.createInstance(this.args.map((x) => x.eval(env)));
     }
 
-    if (f instanceof GenericTypeValue) {
-      return f.createType(
+    if (v instanceof GenericTypeValue) {
+      return v.createType(
         this.args.map((x) => {
           const type = x.eval(env);
           if (!(type instanceof TypeValue)) {
@@ -522,7 +518,7 @@ class VarCallSyntax extends Syntax {
       throw new Error(`${this.name.text}は見つかりません。token=${this.name}`);
     }
     this.type = v;
-    return this.type;
+    return v;
   }
 
   eval(env: Environment): LValue {
@@ -577,7 +573,6 @@ class StructFieldCallSyntax extends Syntax {
 
     const ss = f.fieldType;
     if (this.child instanceof Token) {
-      // LSP のバグっぽいため as をつけている
       const ff = ss.fields.find((x) => x.name === (this.child as Token).text);
       if (!ff) {
         throw new Error(
@@ -703,7 +698,7 @@ class PrimitiveTypeSyntax extends TypeSyntax {
       throw new Error(`${this.name.text}は見つかりません。token=${this.name}`);
     }
     this.type = value;
-    return this.type;
+    return value;
   }
 
   eval(env: Environment): TypeValue {
@@ -1458,14 +1453,6 @@ function typeParser(syntaxs: Syntax[], env: Environment): Syntax[] {
   return syntaxs;
 }
 
-const enum PrimitiveType {
-  Any = "Any",
-  Type = "Type",
-  Num = "Num",
-  Bool = "Bool",
-  Null = "Null",
-}
-
 abstract class LValue {
   toString(): string {
     return dumpObj(this);
@@ -1474,12 +1461,59 @@ abstract class LValue {
   abstract toType(): TypeValue;
 }
 
+abstract class TypeValue extends LValue {
+  parent: TypeValue | undefined;
+
+  constructor(p: TypeValue | undefined) {
+    super();
+    this.parent = p;
+  }
+
+  abstract equalType(other: TypeValue): boolean;
+
+  isAncestor(other: TypeValue): boolean {
+    if (equalType(this, other)) return true;
+    if (this.parent === undefined) return false;
+    return this.parent.isAncestor(other);
+  }
+}
+
+class NullTypeValue extends TypeValue {
+  constructor() {
+    super(new AnyTypeValue());
+  }
+
+  equalType(other: NullTypeValue): boolean {
+    if (other.constructor !== NullTypeValue) return false;
+    return true;
+  }
+
+  toType(): TypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
 class NullValue extends LValue {
-  toType(): PrimitiveTypeValue {
+  toType(): NullTypeValue {
     return BUILDIN_TYPES.Null;
   }
 }
 const LNull = new NullValue();
+
+class BoolTypeValue extends TypeValue {
+  constructor() {
+    super(new AnyTypeValue());
+  }
+
+  equalType(other: BoolTypeValue): boolean {
+    if (other.constructor !== BoolTypeValue) return false;
+    return true;
+  }
+
+  toType(): TypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
 
 class BoolValue extends LValue {
   value: boolean;
@@ -1489,8 +1523,23 @@ class BoolValue extends LValue {
     this.value = value;
   }
 
-  toType(): PrimitiveTypeValue {
+  toType(): BoolTypeValue {
     return BUILDIN_TYPES.Bool;
+  }
+}
+
+class NumTypeValue extends TypeValue {
+  constructor() {
+    super(new AnyTypeValue());
+  }
+
+  equalType(other: NumTypeValue): boolean {
+    if (other.constructor !== NumTypeValue) return false;
+    return true;
+  }
+
+  toType(): TypeValue {
+    return BUILDIN_TYPES.Type;
   }
 }
 
@@ -1502,49 +1551,51 @@ class NumValue extends LValue {
     this.value = value;
   }
 
-  toType(): PrimitiveTypeValue {
+  toType(): NumTypeValue {
     return BUILDIN_TYPES.Num;
   }
 }
 
-abstract class TypeValue extends LValue {
-  primitive: PrimitiveType;
-
-  constructor(p: PrimitiveType) {
-    super();
-    this.primitive = p;
+class AnyTypeValue extends TypeValue {
+  constructor() {
+    super(undefined);
   }
 
-  abstract equalType(other: TypeValue): boolean;
-}
-
-abstract class ConstructorTypeValue extends TypeValue {
-  abstract createInstance(args: LValue[]): LValue;
-}
-
-abstract class GenericTypeValue extends TypeValue {
-  abstract createType(args: TypeValue[]): ConstructorTypeValue;
-}
-
-class PrimitiveTypeValue extends TypeValue {
-  equalType(other: PrimitiveTypeValue): boolean {
-    if (other.constructor !== PrimitiveTypeValue) {
-      throw new Error(`type が揃っていません。other = ${other} `);
-    }
-    return this.primitive === other.primitive;
+  equalType(other: AnyTypeValue): boolean {
+    if (other.constructor !== AnyTypeValue) return false;
+    return true;
   }
 
-  toType(): PrimitiveTypeValue {
+  toType(): TypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class TypeTypeValue extends TypeValue {
+  constructor() {
+    super(new AnyTypeValue());
+  }
+
+  equalType(other: TypeTypeValue): boolean {
+    if (other.constructor !== TypeTypeValue) return false;
+    return true;
+  }
+
+  toType(): TypeValue {
     return BUILDIN_TYPES.Type;
   }
 }
 
 class FnTypeValue extends TypeValue {
+  static is(x: any): x is FnTypeValue {
+    return x.constructor === FnTypeValue;
+  }
+
   args: TypeValue[];
   returnType: TypeValue;
 
   constructor(args: TypeValue[], returnType: TypeValue) {
-    super(PrimitiveType.Type);
+    super(new AnyTypeValue());
     this.args = args;
     this.returnType = returnType;
   }
@@ -1559,165 +1610,8 @@ class FnTypeValue extends TypeValue {
     return equalType(this.args, other.args);
   }
 
-  toType(): PrimitiveTypeValue {
+  toType(): TypeTypeValue {
     return BUILDIN_TYPES.Type;
-  }
-}
-
-class StructTypeValue extends ConstructorTypeValue {
-  fields: StructFieldValue[];
-
-  constructor(fields: StructFieldValue[]) {
-    super(PrimitiveType.Type);
-    this.fields = fields;
-  }
-
-  createInstance(args: LValue[]): StructInstanceValue {
-    const map: Map<string, LValue> = new Map();
-
-    this.fields.forEach((x, i) => {
-      const value = args[i] ?? LNull;
-      map.set(x.name, value);
-    });
-
-    return new StructInstanceValue(this.fields, map);
-  }
-
-  equalType(other: StructTypeValue): boolean {
-    if (other.constructor !== StructTypeValue) {
-      throw new Error(`type が揃っていません。other = ${other} `);
-    }
-
-    return equalType(
-      this.fields.map((x) => x.fieldType),
-      other.fields.map((x) => x.fieldType),
-    );
-  }
-
-  toType(): PrimitiveTypeValue {
-    return BUILDIN_TYPES.Type;
-  }
-}
-
-class StructInstanceValue extends LValue {
-  fields: StructFieldValue[];
-  map: Map<string, LValue>;
-
-  constructor(fields: StructFieldValue[], map: Map<string, LValue>) {
-    super();
-    this.fields = fields;
-    this.map = map;
-  }
-
-  get(key: string): LValue {
-    const result = this.map.get(key);
-    if (!result) {
-      throw new Error(`${key} は存在しないフィールドです。struct = ${this} `);
-    }
-    return result;
-  }
-
-  toType(): StructTypeValue {
-    return new StructTypeValue(this.fields);
-  }
-}
-
-class StructFieldValue {
-  name: string;
-  fieldType: TypeValue;
-
-  constructor(name: string, fieldType: TypeValue) {
-    this.name = name;
-    this.fieldType = fieldType;
-  }
-}
-
-class OrGenericTypeValue extends GenericTypeValue {
-  constructor() {
-    super(PrimitiveType.Type);
-  }
-
-  createType(args: TypeValue[]): OrTypeValue {
-    return new OrTypeValue(args);
-  }
-
-  equalType(other: OrGenericTypeValue): boolean {
-    return other.constructor === OrGenericTypeValue;
-  }
-
-  toType(): PrimitiveTypeValue {
-    return BUILDIN_TYPES.Type;
-  }
-}
-
-class OrTypeValue extends ConstructorTypeValue {
-  static create(types: TypeValue[]): TypeValue {
-    const t = uniqueType(types);
-    if (t.length === 0) {
-      return BUILDIN_TYPES.Null;
-    } else if (t.length === 1) {
-      return t[0];
-    } else {
-      return new OrTypeValue(t);
-    }
-  }
-
-  types: TypeValue[];
-
-  constructor(types: TypeValue[]) {
-    super(PrimitiveType.Type);
-    if (types.length < 2) {
-      throw new Error(`Orには二つ以上のデータ型が必要です。args = ${types} `);
-    }
-    if (types.length !== uniqueType(types).length) {
-      throw new Error(`データ型が重複しています。types=${types}`);
-    }
-    this.types = types;
-  }
-
-  createInstance(args: LValue[]): OrInstanceValue {
-    if (args.length !== 1) {
-      throw new Error(`Orには一つ以上のデータ型が必要です。args = ${args} `);
-    }
-
-    const types: TypeValue[] = [];
-    for (const arg of args) {
-      if (arg instanceof TypeValue) {
-        types.push(arg);
-      } else {
-        throw new Error(`引数はデータ型のみです。`);
-      }
-    }
-
-    if (types.length !== uniqueType(types).length) {
-      throw new Error(`データ型が重複しています。types=${types}`);
-    }
-
-    return new OrInstanceValue(args[0], this);
-  }
-
-  equalType(other: OrTypeValue): boolean {
-    if (other.constructor !== OrTypeValue) return false;
-    return equalType(this.types, other.types);
-  }
-
-  toType(): PrimitiveTypeValue {
-    return BUILDIN_TYPES.Type;
-  }
-}
-
-class OrInstanceValue extends LValue {
-  value: LValue;
-  type: OrTypeValue;
-
-  constructor(value: LValue, type: OrTypeValue) {
-    super();
-    this.value = value;
-    this.type = type;
-  }
-
-  toType(): OrTypeValue {
-    return this.type;
   }
 }
 
@@ -1732,6 +1626,10 @@ class FnArgValue {
 }
 
 abstract class FnValue extends LValue {
+  static is(x: any): x is FnValue {
+    return x instanceof FnValue;
+  }
+
   defArgs: FnArgValue[];
   returnType: TypeValue;
 
@@ -1797,24 +1695,287 @@ class FnUserValue extends FnValue {
   }
 }
 
+class FnList<A> extends TypeValue {
+  static isType(x: any[]): x is FnTypeValue[] {
+    const xx = x[0];
+    if (xx === undefined) return true;
+    if (xx instanceof FnTypeValue) return true;
+    return false;
+  }
+
+  static isValue(x: any[]): x is FnValue[] {
+    const xx = x[0];
+    if (xx === undefined) return true;
+    if (xx instanceof FnValue) return true;
+    return false;
+  }
+
+  list: A[];
+
+  constructor(...args: A[]) {
+    super(new AnyTypeValue());
+    this.list = args;
+  }
+
+  findType(args: TypeValue[]): FnTypeValue | undefined {
+    if (this.list.length === 0) return undefined;
+    if (FnList.isType(this.list)) {
+      const list = this.list.filter((x: FnTypeValue): boolean => {
+        if (x.args.length !== args.length) return false;
+        for (let i = 0; i < args.length; i++) {
+          const def = x.args[i];
+          const act = args[i];
+          if (!act.isAncestor(def)) return false;
+        }
+        return true;
+      });
+
+      if (list.length === 0) {
+        return undefined;
+      } else if (list.length === 1) {
+        return list[0];
+      } else {
+        throw new Error(
+          `候補となる関数が複数見つかりました。一つになるように関数を追加してください。list=${list}`,
+        );
+      }
+    } else never();
+  }
+
+  findValue(args: TypeValue[]): FnValue | undefined {
+    if (this.list.length === 0) return undefined;
+    if (FnList.isValue(this.list)) {
+      const list = this.list.filter((x: FnValue): boolean => {
+        const type = x.toType();
+        if (type.args.length !== args.length) return false;
+        for (let i = 0; i < args.length; i++) {
+          const def = type.args[i];
+          const act = args[i];
+          if (!act.isAncestor(def)) return false;
+        }
+        return true;
+      });
+
+      if (list.length === 0) {
+        return undefined;
+      } else if (list.length === 1) {
+        return list[0];
+      } else {
+        throw new Error(
+          `候補となる関数が複数見つかりました。一つになるように関数を追加してください。list=${list}`,
+        );
+      }
+    } else never();
+  }
+
+  push(value: A): void {
+    this.list.push(value);
+  }
+
+  concat(other: FnList<A>): FnList<A> {
+    return new FnList(...this.list.concat(other.list));
+  }
+
+  equalType(other: FnList<A>): boolean {
+    if (FnList.isType(this.list) && FnList.isType(other.list)) {
+      return equalType(this.list, other.list);
+    } else {
+      throw new Error(
+        `中身がデータ型出ないのに型として比較しようとしています。`,
+      );
+    }
+  }
+
+  toType(): TypeValue {
+    if (FnList.isValue(this.list)) {
+      return new FnList(...(this.list as LValue[]).map((x) => x.toType()));
+    } else never();
+  }
+}
+
+abstract class ConstructorTypeValue extends TypeValue {
+  abstract createInstance(args: LValue[]): LValue;
+}
+
+abstract class GenericTypeValue extends TypeValue {
+  abstract createType(args: TypeValue[]): ConstructorTypeValue;
+}
+
+class StructTypeValue extends ConstructorTypeValue {
+  fields: StructFieldValue[];
+
+  constructor(fields: StructFieldValue[]) {
+    super(new AnyTypeValue());
+    this.fields = fields;
+  }
+
+  createInstance(args: LValue[]): StructInstanceValue {
+    const map: Map<string, LValue> = new Map();
+
+    this.fields.forEach((x, i) => {
+      const value = args[i] ?? LNull;
+      map.set(x.name, value);
+    });
+
+    return new StructInstanceValue(this.fields, map);
+  }
+
+  equalType(other: StructTypeValue): boolean {
+    if (other.constructor !== StructTypeValue) {
+      throw new Error(`type が揃っていません。other = ${other} `);
+    }
+
+    return equalType(
+      this.fields.map((x) => x.fieldType),
+      other.fields.map((x) => x.fieldType),
+    );
+  }
+
+  toType(): TypeTypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class StructInstanceValue extends LValue {
+  fields: StructFieldValue[];
+  map: Map<string, LValue>;
+
+  constructor(fields: StructFieldValue[], map: Map<string, LValue>) {
+    super();
+    this.fields = fields;
+    this.map = map;
+  }
+
+  get(key: string): LValue {
+    const result = this.map.get(key);
+    if (!result) {
+      throw new Error(`${key} は存在しないフィールドです。struct = ${this} `);
+    }
+    return result;
+  }
+
+  toType(): StructTypeValue {
+    return new StructTypeValue(this.fields);
+  }
+}
+
+class StructFieldValue {
+  name: string;
+  fieldType: TypeValue;
+
+  constructor(name: string, fieldType: TypeValue) {
+    this.name = name;
+    this.fieldType = fieldType;
+  }
+}
+
+class OrGenericTypeValue extends GenericTypeValue {
+  constructor() {
+    super(new AnyTypeValue());
+  }
+
+  createType(args: TypeValue[]): OrTypeValue {
+    return new OrTypeValue(args);
+  }
+
+  equalType(other: OrGenericTypeValue): boolean {
+    return other.constructor === OrGenericTypeValue;
+  }
+
+  toType(): TypeTypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class OrTypeValue extends ConstructorTypeValue {
+  static create(types: TypeValue[]): TypeValue {
+    const t = uniqueType(types);
+    if (t.length === 0) {
+      return BUILDIN_TYPES.Null;
+    } else if (t.length === 1) {
+      return t[0];
+    } else {
+      return new OrTypeValue(t);
+    }
+  }
+
+  types: TypeValue[];
+
+  constructor(types: TypeValue[]) {
+    super(new OrGenericTypeValue());
+    if (types.length < 2) {
+      throw new Error(`Orには二つ以上のデータ型が必要です。args = ${types} `);
+    }
+    if (types.length !== uniqueType(types).length) {
+      throw new Error(`データ型が重複しています。types=${types}`);
+    }
+    this.types = types;
+  }
+
+  createInstance(args: LValue[]): OrInstanceValue {
+    if (args.length !== 1) {
+      throw new Error(`Orには一つ以上のデータ型が必要です。args = ${args} `);
+    }
+
+    const types: TypeValue[] = [];
+    for (const arg of args) {
+      if (arg instanceof TypeValue) {
+        types.push(arg);
+      } else {
+        throw new Error(`引数はデータ型のみです。`);
+      }
+    }
+
+    if (types.length !== uniqueType(types).length) {
+      throw new Error(`データ型が重複しています。types=${types}`);
+    }
+
+    return new OrInstanceValue(args[0], this);
+  }
+
+  equalType(other: OrTypeValue): boolean {
+    if (other.constructor !== OrTypeValue) return false;
+    return equalType(this.types, other.types);
+  }
+
+  toType(): TypeTypeValue {
+    return BUILDIN_TYPES.Type;
+  }
+}
+
+class OrInstanceValue extends LValue {
+  value: LValue;
+  type: OrTypeValue;
+
+  constructor(value: LValue, type: OrTypeValue) {
+    super();
+    this.value = value;
+    this.type = type;
+  }
+
+  toType(): OrTypeValue {
+    return this.type;
+  }
+}
+
 const BUILDIN_TYPES = {
-  Num: new PrimitiveTypeValue(PrimitiveType.Num),
-  Bool: new PrimitiveTypeValue(PrimitiveType.Bool),
-  Null: new PrimitiveTypeValue(PrimitiveType.Null),
-  Any: new PrimitiveTypeValue(PrimitiveType.Any),
-  Type: new PrimitiveTypeValue(PrimitiveType.Type),
+  Num: new NumTypeValue(),
+  Bool: new BoolTypeValue(),
+  Null: new NullTypeValue(),
+  Any: new AnyTypeValue(),
+  Type: new TypeTypeValue(),
   Or: new OrGenericTypeValue(),
 };
 
 class Environment {
-  scope: Scope<LValue>;
-  compileScope: Scope<TypeValue>;
+  scope: Scope<LValue, FnValue>;
+  compileScope: Scope<TypeValue, FnTypeValue>;
   readonly buildinType: Record<string, TypeValue>;
   readonly buildinFn: Record<string, FnBuildinValue>;
 
   constructor() {
-    this.scope = new Scope();
-    this.compileScope = new Scope();
+    this.scope = new Scope(FnValue.is);
+    this.compileScope = new Scope(FnTypeValue.is);
 
     this.buildinType = BUILDIN_TYPES;
 
@@ -1854,18 +2015,20 @@ class Environment {
   }
 }
 
-class Scope<T> {
-  now: ScopeCore<T>;
+class Scope<A, B> {
+  now: ScopeCore<A, B>;
+  isB: (x: any) => x is B;
 
-  constructor() {
-    this.now = new ScopeCore(undefined);
+  constructor(isB: (x: any) => x is B) {
+    this.isB = isB;
+    this.now = new ScopeCore(isB, undefined);
   }
 
-  set(key: string, value: T): void {
+  set(key: string, value: A | B | FnList<B>): void {
     this.now.set(key, value);
   }
 
-  get(key: string): T | undefined {
+  get(key: string): A | FnList<B> | undefined {
     return this.now.get(key);
   }
 
@@ -1874,7 +2037,7 @@ class Scope<T> {
   }
 
   create(): void {
-    this.now = new ScopeCore(this.now);
+    this.now = new ScopeCore(this.isB, this.now);
   }
 
   delete(): void {
@@ -1886,20 +2049,63 @@ class Scope<T> {
   }
 }
 
-class ScopeCore<T> {
-  parent: ScopeCore<T> | undefined;
-  map: Map<string, T>;
+class ScopeCore<A, B> {
+  parent: ScopeCore<A, B> | undefined;
+  map: Map<string, A | FnList<B>>;
+  isB: (x: any) => x is B;
 
-  constructor(parent: ScopeCore<T> | undefined) {
+  constructor(isB: (x: any) => x is B, parent: ScopeCore<A, B> | undefined) {
     this.parent = parent;
     this.map = new Map();
+    this.isB = isB;
   }
 
-  set(key: string, value: T): void {
+  set(key: string, value: A | B | FnList<B>): void {
+    if (this.isB(value)) {
+      this.#setFn(key, value);
+    } else if (value instanceof FnList) {
+      this.#setFnList(key, value);
+    } else {
+      this.#setOne(key, value as A);
+    }
+  }
+
+  #setOne(key: string, value: A): void {
     this.map.set(key, value);
   }
 
-  get(key: string): T | undefined {
+  #setFn(key: string, value: B): void {
+    if (this.map.has(key)) {
+      const list = this.map.get(key);
+      if (list instanceof FnList) {
+        list.push(value);
+      } else never();
+    } else {
+      this.map.set(key, new FnList(value));
+    }
+  }
+
+  #setFnList(key: string, value: FnList<B>): void {
+    if (this.map.has(key)) {
+      const list = this.map.get(key);
+      if (list instanceof FnList) {
+        this.map.set(key, list.concat(value));
+      } else never();
+    }
+  }
+
+  get(key: string): A | FnList<B> | undefined {
+    const v = this.#getOne(key);
+    if (v === undefined) {
+      return undefined;
+    } else if (v instanceof FnList) {
+      return this.#getAll(key);
+    } else {
+      return v;
+    }
+  }
+
+  #getOne(key: string): A | FnList<B> | undefined {
     if (this.map.has(key)) {
       return this.map.get(key)!;
     } else {
@@ -1908,6 +2114,24 @@ class ScopeCore<T> {
       } else {
         return undefined;
       }
+    }
+  }
+
+  #getAll(key: string): FnList<B> {
+    let result: FnList<B>;
+    if (this.parent === undefined) {
+      result = new FnList();
+    } else {
+      result = this.parent.#getAll(key);
+    }
+
+    const v = this.map.get(key);
+    if (v === undefined) {
+      return result;
+    } else if (v instanceof FnList) {
+      return v.concat(result);
+    } else {
+      throw new Error(`A型のデータに対して getAll してしまっています。v=${v}`);
     }
   }
 

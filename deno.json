@@ -1,6 +1,0 @@
-{
-  "tasks": {
-    "test": "deno run test.ts",
-    "debug": "deno run --inspect-brk test.ts"
-  }
-}

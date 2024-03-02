@@ -1,0 +1,15 @@
+{
+  "name": "yohaku",
+  "module": "interpreter.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bun run test.ts",
+    "debug": "bun run --inspect-brk test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

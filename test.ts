@@ -1,9 +1,11 @@
 import { interprete } from "./interpreter.ts";
 
 interprete(`
-           a = if false { 1 } { null }
+           add = fn a Num b Null -> Num { a }
+           add = fn a Null b Num -> Num { b }
+           add = fn a Null b Null -> Null { null }
 
-           c = match a { Num x { print (add x 1) } Null a { print a }
-             else a { print 3 }
-           }
+           print (add 1 null)
+           print (add null 2)
+           print (add null null)
 `);
