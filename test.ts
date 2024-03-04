@@ -1,11 +1,12 @@
 import { interprete } from "./interpreter.ts";
 
 interprete(`
-           times = fn count Num callback (Fn Num -> Null) -> Null {
-             if (<= count 0) {} {
-               self (sub count 1) callback
-             }
-           }
+my_times = fn count Num -> Null {
+  if (<= count 0) {} {
+    self (sub count 1)
+    print count
+  }
+}
 
-           times 3 (fn i Num -> Null {print i})
+my_times 5
 `);

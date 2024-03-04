@@ -325,12 +325,6 @@ class VarDefSyntax extends Syntax {
       return value;
     }
 
-    if (name instanceof FnList && value instanceof FnTypeValue) {
-      env.compileScope.set(this.name.text, value);
-      this.type = value;
-      return value;
-    }
-
     throw new Error(
       `${this.name.text}は既に定義されています。token=${this.name}`,
     );
@@ -341,11 +335,6 @@ class VarDefSyntax extends Syntax {
     const value = this.value.eval(env);
 
     if (name === undefined) {
-      env.scope.set(this.name.text, value);
-      return value;
-    }
-
-    if (name instanceof FnList && value instanceof FnValue) {
       env.scope.set(this.name.text, value);
       return value;
     }
@@ -441,30 +430,38 @@ class FnCallSyntax extends Syntax {
   }
 
   typeEval(env: Environment): TypeValue {
-    const v = env.compileScope.get(this.name.text);
-    if (!v) throw new Error(`関数が見つかりません。token=${this.name}`);
+    const f = env.compileScope.get(this.name.text);
+    if (!f) throw new Error(`関数が見つかりません。token=${this.name}`);
 
     const argTypes = this.args.map((x) => x.typeEval(env));
 
-    if (v instanceof FnList) {
-      const f = v.findMatch(argTypes);
-      if (f === undefined) {
-        throw new Error(
-          `${this.name.text}関数が見つかりませんでした。token=${this.name}`,
-        );
+    if (f instanceof FnTypeValue) {
+      if (f.args.length !== argTypes.length)
+        throw new Error(`関数の引数の数が一致していません。token=${this.name}`);
+
+      for (let i = 0; i < argTypes.length; i++) {
+        const d = f.args[i];
+        const a = argTypes[i];
+
+        if (equalType(d, BUILDIN_TYPES.Any)) continue;
+
+        if (!equalType(d, a))
+          throw new Error(
+            `${this.name.text}関数の${i + 1}番目の引数の型が一致しません。define=${d}, actual=${a}, token=${this.name}`,
+          );
       }
 
       this.type = f.returnType;
       return f.returnType;
     }
 
-    if (v instanceof StructTypeValue) {
-      this.type = v;
+    if (f instanceof StructTypeValue) {
+      this.type = f;
       return this.type;
     }
 
-    if (v instanceof GenericTypeValue) {
-      this.type = v.createType(argTypes);
+    if (f instanceof GenericTypeValue) {
+      this.type = f.createType(argTypes);
       return this.type;
     }
 
@@ -472,27 +469,20 @@ class FnCallSyntax extends Syntax {
   }
 
   eval(env: Environment): LValue {
-    const v = env.scope.get(this.name.text);
-    if (!v) throw new Error(`関数が見つかりません。token=${this.name}`);
+    const f = env.scope.get(this.name.text);
+    if (!f) throw new Error(`関数が見つかりません。token=${this.name}`);
 
-    if (v instanceof FnList) {
+    if (f instanceof FnValue) {
       const args = this.args.map((x) => x.eval(env));
-
-      const f = v.findMatch(args.map((x) => x.toType()));
-      if (f === undefined)
-        throw new Error(
-          `${this.name.text}関数が見つかりませんでした。token=${this.name}`,
-        );
-
       return f.call(env, args);
     }
 
-    if (v instanceof StructTypeValue) {
-      return v.createInstance(this.args.map((x) => x.eval(env)));
+    if (f instanceof StructTypeValue) {
+      return f.createInstance(this.args.map((x) => x.eval(env)));
     }
 
-    if (v instanceof GenericTypeValue) {
-      return v.createType(
+    if (f instanceof GenericTypeValue) {
+      return f.createType(
         this.args.map((x) => {
           const type = x.eval(env);
           if (!(type instanceof TypeValue)) {
@@ -609,30 +599,21 @@ class StructFieldCallSyntax extends Syntax {
   }
 
   recurseTypeEval(s: StructTypeValue): TypeValue {
-    const f = s.fields.find((x) => x.name === this.parent.text);
-    if (!f) {
-      throw new Error(
-        `${this.parent.text}は見つかりませんでした。token=${this.parent}`,
-      );
-    }
-    if (!(f.fieldType instanceof StructTypeValue)) {
-      throw new Error(
-        `${this.parent.text}は構造体ではありません。token=${this.parent}`,
-      );
-    }
-
-    const ss = f.fieldType;
     if (this.child instanceof Token) {
-      const ff = ss.fields.find((x) => x.name === (this.child as Token).text);
-      if (!ff) {
+      const f = s.fields.find((x) => x.name === (this.child as Token).text);
+      if (!f) {
         throw new Error(
           `${this.child.text}は構造体のフィールド名ではありません。token=${this.child}`,
         );
       }
-      this.type = ff.fieldType;
-      return ff.fieldType;
+      this.type = f.fieldType;
+      return f.fieldType;
     } else {
-      const result = this.recurseTypeEval(ss);
+      const fieldName = this.child.parent.text;
+      const ss = s.fields.find((x) => x.name == fieldName)?.fieldType;
+      if (!(ss instanceof StructTypeValue))
+        throw new Error(`${fieldName}は構造体ではありません。`);
+      const result = this.child.recurseTypeEval(ss);
       this.type = result;
       return result;
     }
@@ -1799,176 +1780,6 @@ class FnUserValue extends FnValue {
   }
 }
 
-class FnList<A> extends TypeValue {
-  static isType(x: any[]): x is FnTypeValue[] {
-    const xx = x[0];
-    if (xx === undefined) return true;
-    if (xx instanceof FnTypeValue) return true;
-    return false;
-  }
-
-  static isValue(x: any[]): x is FnValue[] {
-    const xx = x[0];
-    if (xx === undefined) return true;
-    if (xx instanceof FnValue) return true;
-    return false;
-  }
-
-  list: A[];
-
-  constructor(...args: A[]) {
-    super(new AnyTypeValue());
-    this.list = args;
-  }
-
-  findMatch(args: TypeValue[]): A | undefined {
-    if (FnList.isType(this.list)) {
-      return this.#findMatchType(args) as A;
-    }
-
-    if (FnList.isValue(this.list)) {
-      return this.#findMatchValue(args) as A;
-    }
-
-    never();
-  }
-
-  #findMatchType(args: TypeValue[]): FnTypeValue | undefined {
-    if (this.list.length === 0) return undefined;
-    if (FnList.isType(this.list)) {
-      const list = this.list.filter((x: FnTypeValue): boolean => {
-        if (x.args.length !== args.length) return false;
-        for (let i = 0; i < args.length; i++) {
-          const def = x.args[i];
-          const act = args[i];
-
-          if (act instanceof FnList && def instanceof FnTypeValue) {
-            if (!act.findFn(def)) return false;
-          } else {
-            if (!act.isAncestor(def)) return false;
-          }
-        }
-        return true;
-      });
-
-      if (list.length === 0) {
-        return undefined;
-      } else if (list.length === 1) {
-        return list[0];
-      } else {
-        throw new Error(
-          `候補となる関数が複数見つかりました。一つになるように関数を追加してください。list=${list}`,
-        );
-      }
-    } else never();
-  }
-
-  #findMatchValue(args: TypeValue[]): FnValue | undefined {
-    if (this.list.length === 0) return undefined;
-    if (FnList.isValue(this.list)) {
-      const list = this.list.filter((x: FnValue): boolean => {
-        const type = x.toType();
-        if (type.args.length !== args.length) return false;
-        for (let i = 0; i < args.length; i++) {
-          const def = type.args[i];
-          const act = args[i];
-
-          if (act instanceof FnList && def instanceof FnTypeValue) {
-            if (!act.findFn(def)) return false;
-          } else {
-            if (!act.isAncestor(def)) return false;
-          }
-        }
-        return true;
-      });
-
-      if (list.length === 0) {
-        return undefined;
-      } else if (list.length === 1) {
-        return list[0];
-      } else {
-        throw new Error(
-          `候補となる関数が複数見つかりました。一つになるように関数を追加してください。list=${list}`,
-        );
-      }
-    } else never();
-  }
-
-  findFn(x: FnTypeValue): A | undefined {
-    if (FnList.isType(this.list)) {
-      return this.#findFnType(x) as A;
-    }
-
-    if (FnList.isValue(this.list)) {
-      return this.#findFnValue(x) as A;
-    }
-
-    never();
-  }
-
-  #findFnType(arg: FnTypeValue): FnTypeValue | undefined {
-    if (!FnList.isType(this.list)) never();
-
-    const list = (this.list as FnTypeValue[]).filter((x) => equalType(x, arg));
-
-    if (list.length === 0) {
-      return undefined;
-    } else if (list.length === 1) {
-      return list[0];
-    } else {
-      throw new Error(
-        `候補となる関数が複数見つかりました。一つになるように関数を追加してください。list=${list}`,
-      );
-    }
-  }
-
-  #findFnValue(arg: FnTypeValue): FnValue | undefined {
-    if (!FnList.isValue(this.list)) never();
-
-    const list = (this.list as FnValue[]).filter((x) =>
-      equalType(x.toType(), arg),
-    );
-
-    if (list.length === 0) {
-      return undefined;
-    } else if (list.length === 1) {
-      return list[0];
-    } else {
-      throw new Error(
-        `候補となる関数が複数見つかりました。一つになるように関数を追加してください。list=${list}`,
-      );
-    }
-  }
-
-  push(value: A): void {
-    this.list.push(value);
-  }
-
-  concat(other: FnList<A>): FnList<A> {
-    return new FnList(...this.list.concat(other.list));
-  }
-
-  equalType(other: FnList<A>): boolean {
-    if (FnList.isType(this.list) && FnList.isType(other.list)) {
-      return equalType(this.list, other.list);
-    } else {
-      throw new Error(
-        `中身がデータ型出ないのに型として比較しようとしています。`,
-      );
-    }
-  }
-
-  toType(): TypeValue {
-    if (FnList.isValue(this.list)) {
-      return new FnList(...(this.list as LValue[]).map((x) => x.toType()));
-    } else never();
-  }
-
-  toString(): string {
-    return `(FnList ${this.list.join(" ")})`;
-  }
-}
-
 abstract class ConstructorTypeValue extends TypeValue {
   abstract createInstance(args: LValue[]): LValue;
 }
@@ -2171,13 +1982,13 @@ const BUILDIN_TYPES: Record<string, TypeValue> = {
 };
 
 class Environment {
-  scope: Scope<LValue, FnValue>;
-  compileScope: Scope<TypeValue, FnTypeValue>;
-  readonly buildinFn: Record<string, FnBuildinValue | FnList<FnBuildinValue>>;
+  scope: Scope<LValue>;
+  compileScope: Scope<TypeValue>;
+  readonly buildinFn: Record<string, FnBuildinValue>;
 
   constructor() {
-    this.scope = new Scope(FnValue.is);
-    this.compileScope = new Scope(FnTypeValue.is);
+    this.scope = new Scope();
+    this.compileScope = new Scope();
 
     this.buildinFn = {
       break: new FnBuildinValue(
@@ -2191,7 +2002,8 @@ class Environment {
         [new FnArgValue("arg", BUILDIN_TYPES.Any)],
         BUILDIN_TYPES.Null,
         (...args: LValue[]) => {
-          console.log(...args);
+          const a = args[0];
+          console.log(a.toString());
           return LNull;
         },
       ),
@@ -2293,6 +2105,24 @@ class Environment {
           return new BoolValue(a.value >= b.value);
         },
       ),
+      times: new FnBuildinValue(
+        [
+          new FnArgValue("count", BUILDIN_TYPES.Num),
+          new FnArgValue(
+            "callback",
+            new FnTypeValue([BUILDIN_TYPES.Num], BUILDIN_TYPES.Null),
+          ),
+        ],
+        BUILDIN_TYPES.Null,
+        (...args) => {
+          const count = args[0] as NumValue;
+          const callback = args[1] as FnValue;
+          for (let i = 0; i < count.value; i++) {
+            callback.call(this, [new NumValue(i)]);
+          }
+          return LNull;
+        },
+      ),
     };
 
     for (const key in BUILDIN_TYPES) {
@@ -2306,20 +2136,18 @@ class Environment {
   }
 }
 
-class Scope<A, B> {
-  now: ScopeCore<A, B>;
-  isB: (x: any) => x is B;
+class Scope<A> {
+  now: ScopeCore<A>;
 
-  constructor(isB: (x: any) => x is B) {
-    this.isB = isB;
-    this.now = new ScopeCore(isB, undefined);
+  constructor() {
+    this.now = new ScopeCore(undefined);
   }
 
-  set(key: string, value: A | B | FnList<B>): void {
+  set(key: string, value: A): void {
     this.now.set(key, value);
   }
 
-  get(key: string): A | FnList<B> | undefined {
+  get(key: string): A | undefined {
     return this.now.get(key);
   }
 
@@ -2328,7 +2156,7 @@ class Scope<A, B> {
   }
 
   create(): void {
-    this.now = new ScopeCore(this.isB, this.now);
+    this.now = new ScopeCore(this.now);
   }
 
   delete(): void {
@@ -2340,63 +2168,20 @@ class Scope<A, B> {
   }
 }
 
-class ScopeCore<A, B> {
-  parent: ScopeCore<A, B> | undefined;
-  map: Map<string, A | FnList<B>>;
-  isB: (x: any) => x is B;
+class ScopeCore<A> {
+  parent: ScopeCore<A> | undefined;
+  map: Map<string, A>;
 
-  constructor(isB: (x: any) => x is B, parent: ScopeCore<A, B> | undefined) {
+  constructor(parent: ScopeCore<A> | undefined) {
     this.parent = parent;
     this.map = new Map();
-    this.isB = isB;
   }
 
-  set(key: string, value: A | B | FnList<B>): void {
-    if (this.isB(value)) {
-      this.#setFn(key, value);
-    } else if (value instanceof FnList) {
-      this.#setFnList(key, value);
-    } else {
-      this.#setOne(key, value as A);
-    }
-  }
-
-  #setOne(key: string, value: A): void {
+  set(key: string, value: A): void {
     this.map.set(key, value);
   }
 
-  #setFn(key: string, value: B): void {
-    if (this.map.has(key)) {
-      const list = this.map.get(key);
-      if (list instanceof FnList) {
-        list.push(value);
-      } else never();
-    } else {
-      this.map.set(key, new FnList(value));
-    }
-  }
-
-  #setFnList(key: string, value: FnList<B>): void {
-    if (this.map.has(key)) {
-      const list = this.map.get(key);
-      if (list instanceof FnList) {
-        this.map.set(key, list.concat(value));
-      } else never();
-    }
-  }
-
-  get(key: string): A | FnList<B> | undefined {
-    const v = this.#getOne(key);
-    if (v === undefined) {
-      return undefined;
-    } else if (v instanceof FnList) {
-      return this.#getAll(key);
-    } else {
-      return v;
-    }
-  }
-
-  #getOne(key: string): A | FnList<B> | undefined {
+  get(key: string): A | undefined {
     if (this.map.has(key)) {
       return this.map.get(key)!;
     } else {
@@ -2405,24 +2190,6 @@ class ScopeCore<A, B> {
       } else {
         return undefined;
       }
-    }
-  }
-
-  #getAll(key: string): FnList<B> {
-    let result: FnList<B>;
-    if (this.parent === undefined) {
-      result = new FnList();
-    } else {
-      result = this.parent.#getAll(key);
-    }
-
-    const v = this.map.get(key);
-    if (v === undefined) {
-      return result;
-    } else if (v instanceof FnList) {
-      return v.concat(result);
-    } else {
-      throw new Error(`A型のデータに対して getAll してしまっています。v=${v}`);
     }
   }
 
