@@ -1,4 +1,4 @@
-const DELIMITERS = [" ", "\n", "(", ")", "[", "]", "{", "}", "="];
+const DELIMITERS = [" ", "\n", "(", ")", "[", "]", "{", "}"];
 const FN = "fn";
 const FN_TYPE = "Fn";
 const ST = "struct";
@@ -6,6 +6,7 @@ const DOT = ".";
 const RETURN_TYPE = "->";
 const IF = "if";
 const MATCH = "match";
+const LOOP = "loop";
 const CLAUSE = [FN, ST, DOT, RETURN_TYPE, IF, MATCH];
 
 export function interprete(text: string, env?: Environment): Environment {
@@ -35,6 +36,15 @@ function never(): never {
   throw new Error(`never`);
 }
 
+declare global {
+  interface Array<T> {
+    last(): T;
+  }
+}
+Array.prototype.last = function () {
+  return this[this.length - 1];
+};
+
 function skip<T>(list: T[], f: (x: T) => boolean): T[] {
   const item = list[0];
   if (item === undefined) return list;
@@ -44,6 +54,45 @@ function skip<T>(list: T[], f: (x: T) => boolean): T[] {
   } else {
     return list;
   }
+}
+
+function takeBracket(list: Token[], expect: string): Token[] {
+  const BRACKETS: Map<string, string> = new Map([
+    ["{", "}"],
+    ["(", ")"],
+    ["[", "]"],
+  ]);
+  const STARTS: string[] = new Array(...BRACKETS.keys());
+  const end = (x: Token) => BRACKETS.get(x.text);
+
+  const start = list.shift();
+  if (start === undefined) throw new Error("list が空です。");
+  if (!STARTS.includes(start.text))
+    throw new Error(`カッコで始まっていません。start=${start}`);
+  if (expect !== start.text)
+    throw new Error(`${expect}で始まる必要があります。token=${start}`);
+
+  const result: Token[] = [start];
+  const bracketStack: Token[] = [start];
+  for (;;) {
+    if (bracketStack.length === 0) break;
+    const t = list.shift();
+    if (t === undefined)
+      throw new Error(`カッコで閉じる必要があります。token=${bracketStack[0]}`);
+    if (STARTS.includes(t.text)) {
+      bracketStack.push(t);
+      result.push(t);
+      continue;
+    }
+    if (end(bracketStack.last()) === t.text) {
+      bracketStack.pop();
+      result.push(t);
+      continue;
+    }
+    result.push(t);
+  }
+
+  return result.slice(1, result.length - 1);
 }
 
 function equalType(
@@ -248,8 +297,8 @@ class SectionParser {
 abstract class Syntax {
   type: TypeValue | undefined = undefined;
 
-  abstract eval(env: Environment): LValue;
   abstract typeEval(env: Environment): TypeValue;
+  abstract eval(env: Environment): LValue;
 
   toString(): string {
     return dumpObj(this);
@@ -318,17 +367,21 @@ class FnDefSyntax extends Syntax {
   }
 
   typeEval(env: Environment): FnTypeValue {
-    const retDef = this.returnType.typeEval(env);
-
     env.compileScope.create();
+
+    const retDef = this.returnType.typeEval(env);
+    const args = this.args.map((x) => x.fieldType.typeEval(env));
+    const result = new FnTypeValue(args, retDef);
 
     this.args.forEach((x) => {
       env.compileScope.set(x.name.text, x.fieldType.typeEval(env));
     });
 
+    env.compileScope.set("self", result);
+
     const retBody = this.body.reduce(
       (_, x) => x.typeEval(env),
-      env.buildinType.Null,
+      BUILDIN_TYPES.Null,
     );
 
     env.compileScope.delete();
@@ -339,10 +392,6 @@ class FnDefSyntax extends Syntax {
       );
     }
 
-    const result = new FnTypeValue(
-      this.args.map((x) => x.fieldType.typeEval(env)),
-      retDef,
-    );
     this.type = result;
     return result;
   }
@@ -398,11 +447,12 @@ class FnCallSyntax extends Syntax {
     const argTypes = this.args.map((x) => x.typeEval(env));
 
     if (v instanceof FnList) {
-      const f = v.findType(this.args.map((x) => x.typeEval(env)));
-      if (f === undefined)
+      const f = v.findMatch(argTypes);
+      if (f === undefined) {
         throw new Error(
           `${this.name.text}関数が見つかりませんでした。token=${this.name}`,
         );
+      }
 
       this.type = f.returnType;
       return f.returnType;
@@ -428,7 +478,7 @@ class FnCallSyntax extends Syntax {
     if (v instanceof FnList) {
       const args = this.args.map((x) => x.eval(env));
 
-      const f = v.findValue(args.map((x) => x.toType()));
+      const f = v.findMatch(args.map((x) => x.toType()));
       if (f === undefined)
         throw new Error(
           `${this.name.text}関数が見つかりませんでした。token=${this.name}`,
@@ -630,8 +680,8 @@ class NumberSyntax extends Syntax {
     this.value = value;
   }
 
-  typeEval(env: Environment): TypeValue {
-    this.type = env.buildinType.Num;
+  typeEval(_env: Environment): TypeValue {
+    this.type = BUILDIN_TYPES.Num;
     return this.type;
   }
 
@@ -648,8 +698,8 @@ class BoolSyntax extends Syntax {
     this.value = value;
   }
 
-  typeEval(env: Environment): TypeValue {
-    this.type = env.buildinType.Bool;
+  typeEval(_env: Environment): TypeValue {
+    this.type = BUILDIN_TYPES.Bool;
     return this.type;
   }
 
@@ -666,8 +716,8 @@ class NullSyntax extends Syntax {
     this.value = value;
   }
 
-  typeEval(env: Environment): TypeValue {
-    this.type = env.buildinType.Null;
+  typeEval(_env: Environment): TypeValue {
+    this.type = BUILDIN_TYPES.Null;
     return this.type;
   }
 
@@ -825,7 +875,7 @@ class IfSyntax extends Syntax {
     env.compileScope.create();
     const thenType = this.thenClause.reduce(
       (_, x) => x.typeEval(env),
-      env.buildinType.Null,
+      BUILDIN_TYPES.Null,
     );
     env.compileScope.delete();
 
@@ -834,7 +884,7 @@ class IfSyntax extends Syntax {
       env.compileScope.create();
       elseType = this.elseClause.reduce(
         (_, x) => x.typeEval(env),
-        env.buildinType.Null,
+        BUILDIN_TYPES.Null,
       );
       env.compileScope.delete();
     }
@@ -894,10 +944,7 @@ class MatchSyntax extends Syntax {
     this.cases.forEach((c) => {
       env.compileScope.create();
       env.compileScope.set(c.arg.text, c.type.typeEval(env));
-      const type = c.body.reduce(
-        (_, x) => x.typeEval(env),
-        env.buildinType.Null,
-      );
+      const type = c.body.reduce((_, x) => x.typeEval(env), BUILDIN_TYPES.Null);
       resultTypes.push(type);
       env.compileScope.delete();
     });
@@ -908,12 +955,12 @@ class MatchSyntax extends Syntax {
       env.compileScope.set(this.elseCase.arg.text, originType);
       const elseType = this.elseCase.body.reduce(
         (_, x) => x.typeEval(env),
-        env.buildinType.Null,
+        BUILDIN_TYPES.Null,
       );
       resultTypes.push(elseType);
       env.compileScope.delete();
     } else {
-      resultTypes.push(env.buildinType.Null);
+      resultTypes.push(BUILDIN_TYPES.Null);
     }
 
     this.type = OrTypeValue.create(resultTypes);
@@ -967,6 +1014,48 @@ class MatchElseCase {
   }
 }
 
+class Break {
+  value: LValue;
+
+  constructor(v: LValue) {
+    this.value = v;
+  }
+}
+
+class LoopSyntax extends Syntax {
+  body: Syntax[];
+
+  constructor(body: Syntax[]) {
+    super();
+    this.body = body;
+  }
+
+  typeEval(env: Environment): TypeValue {
+    env.compileScope.create();
+
+    this.body.forEach((x) => x.typeEval(env));
+
+    env.compileScope.delete();
+
+    return BUILDIN_TYPES.Null;
+  }
+
+  eval(env: Environment): LValue {
+    try {
+      for (;;) {
+        env.scope.create();
+        this.body.forEach((x) => x.eval(env));
+        env.scope.delete();
+      }
+    } catch (e) {
+      if (e instanceof Break) {
+        env.scope.delete();
+        return LNull;
+      } else throw e;
+    }
+  }
+}
+
 // syntax          | top parse | round brackets parse | one value parse
 // --------------- | --------- | -------------------- | ----------------------
 // round brackets  | true      | true                 | true
@@ -974,6 +1063,7 @@ class MatchElseCase {
 // struct define   | true      | true                 | false (by round brackets)
 // if              | true      | true                 | false (by round brackets)
 // match           | true      | true                 | false (by round brackets)
+// loop            | true      | true                 | false (by round brackets)
 // null literal    | true      | true                 | true
 // bool literal    | true      | true                 | true
 // number literal  | true      | true                 | true
@@ -1013,6 +1103,9 @@ class SyntaxParser {
     result = this.matchParse(tokens);
     if (result !== undefined) return result;
 
+    result = this.loopParse(tokens);
+    if (result !== undefined) return result;
+
     result = this.nullParse(tokens);
     if (result !== undefined) return result;
 
@@ -1038,15 +1131,8 @@ class SyntaxParser {
 
   roundBracketsParse(tokens: Token[]): Syntax | undefined {
     if (tokens[0].text !== "(") return undefined;
-    tokens.shift();
 
-    const content: Token[] = [];
-    for (;;) {
-      const token = tokens.shift();
-      if (!token) throw new Error(`)で閉じる必要があります。tokens=${tokens}`);
-      if (token.text === ")") break;
-      content.push(token);
-    }
+    const content: Token[] = takeBracket(tokens, "(");
     return this.roundBracketsContentParse(content);
   }
 
@@ -1066,6 +1152,9 @@ class SyntaxParser {
     if (result !== undefined) return result;
 
     result = this.matchParse(tokens);
+    if (result !== undefined) return result;
+
+    result = this.loopParse(tokens);
     if (result !== undefined) return result;
 
     result = this.nullParse(tokens);
@@ -1139,17 +1228,7 @@ class SyntaxParser {
     const returnType = this.typeParse(tokens);
 
     // 関数のボディの処理
-    const start = tokens.shift();
-    if (!start || start.text !== "{") {
-      throw new Error(`{であるべき。token=${start}`);
-    }
-    const bodyTokens: Token[] = [];
-    for (;;) {
-      const token = tokens.shift();
-      if (!token) throw new Error(`}で閉じる必要があります。`);
-      if (token.text === "}") break;
-      bodyTokens.push(token);
-    }
+    const bodyTokens = takeBracket(tokens, "{");
     const sections = new SectionParser(bodyTokens).run();
     const body = new SyntaxParser(sections).run();
 
@@ -1305,33 +1384,14 @@ class SyntaxParser {
     const condition = this.oneValueParse(tokens);
 
     // then 部分の処理
-    let start = tokens.shift();
-    if (!start || start.text !== "{") {
-      throw new Error(`{であるべきです。token=${start}`);
-    }
-
-    const thenTokens: Token[] = [];
-    for (;;) {
-      const token = tokens.shift();
-      if (!token) throw new Error(`}で閉じる必要があります。token=${start}`);
-      if (token.text === "}") break;
-      thenTokens.push(token);
-    }
+    const thenTokens = takeBracket(tokens, "{");
     const thenSections = new SectionParser(thenTokens).run();
     const thenSyntaxs = new SyntaxParser(thenSections).run();
 
     // else 部分の処理
-    // @ts-ignore maybe a bug in LSP
-    if (tokens[0].text !== "{") return new IfSyntax(condition, thenSyntaxs);
+    if (tokens.length === 0) return new IfSyntax(condition, thenSyntaxs);
 
-    start = tokens.shift();
-    const elseTokens: Token[] = [];
-    for (;;) {
-      const token = tokens.shift();
-      if (!token) throw new Error(`}で閉じる必要があります。token=${start}`);
-      if (token.text === "}") break;
-      elseTokens.push(token);
-    }
+    const elseTokens = takeBracket(tokens, "{");
     const elseSections = new SectionParser(elseTokens).run();
     const elseSyntaxs = new SyntaxParser(elseSections).run();
 
@@ -1377,18 +1437,7 @@ class SyntaxParser {
       }
 
       // body 部分の処理
-      const start = tokens.shift();
-      if (start === undefined) throw new Error(`{で始まる必要があります。`);
-      if (start.text !== "{") {
-        throw new Error(`{で始まる必要があります。token=${start}`);
-      }
-      const bodyTokens: Token[] = [];
-      for (;;) {
-        const t = tokens.shift();
-        if (t === undefined) throw new Error(`}で閉じる必要があります。`);
-        if (t.text === "}") break;
-        bodyTokens.push(t);
-      }
+      const bodyTokens = takeBracket(tokens, "{");
       const bodySyntaxs = new SyntaxParser(
         new SectionParser(bodyTokens).run(),
       ).run();
@@ -1404,6 +1453,18 @@ class SyntaxParser {
     }
 
     return new MatchSyntax(value, cases, elseCase);
+  }
+
+  loopParse(tokens: Token[]): LoopSyntax | undefined {
+    if (LOOP !== tokens[0].text) return undefined;
+    tokens.shift();
+
+    const bodyTokens = takeBracket(tokens, "{");
+    const bodySyntaxs = new SyntaxParser(
+      new SectionParser(bodyTokens).run(),
+    ).run();
+
+    return new LoopSyntax(bodySyntaxs);
   }
 
   nullParse(tokens: Token[]): NullSyntax | undefined {
@@ -1454,10 +1515,7 @@ function typeParser(syntaxs: Syntax[], env: Environment): Syntax[] {
 }
 
 abstract class LValue {
-  toString(): string {
-    return dumpObj(this);
-  }
-
+  abstract toString(): string;
   abstract toType(): TypeValue;
 }
 
@@ -1491,11 +1549,19 @@ class NullTypeValue extends TypeValue {
   toType(): TypeValue {
     return BUILDIN_TYPES.Type;
   }
+
+  toString(): string {
+    return "Null";
+  }
 }
 
 class NullValue extends LValue {
   toType(): NullTypeValue {
     return BUILDIN_TYPES.Null;
+  }
+
+  toString(): string {
+    return "null";
   }
 }
 const LNull = new NullValue();
@@ -1513,6 +1579,10 @@ class BoolTypeValue extends TypeValue {
   toType(): TypeValue {
     return BUILDIN_TYPES.Type;
   }
+
+  toString(): string {
+    return "Bool";
+  }
 }
 
 class BoolValue extends LValue {
@@ -1525,6 +1595,10 @@ class BoolValue extends LValue {
 
   toType(): BoolTypeValue {
     return BUILDIN_TYPES.Bool;
+  }
+
+  toString(): string {
+    return "bool";
   }
 }
 
@@ -1541,6 +1615,10 @@ class NumTypeValue extends TypeValue {
   toType(): TypeValue {
     return BUILDIN_TYPES.Type;
   }
+
+  toString(): string {
+    return "Num";
+  }
 }
 
 class NumValue extends LValue {
@@ -1553,6 +1631,10 @@ class NumValue extends LValue {
 
   toType(): NumTypeValue {
     return BUILDIN_TYPES.Num;
+  }
+
+  toString(): string {
+    return this.value.toString();
   }
 }
 
@@ -1569,6 +1651,10 @@ class AnyTypeValue extends TypeValue {
   toType(): TypeValue {
     return BUILDIN_TYPES.Type;
   }
+
+  toString(): string {
+    return "Any";
+  }
 }
 
 class TypeTypeValue extends TypeValue {
@@ -1583,6 +1669,10 @@ class TypeTypeValue extends TypeValue {
 
   toType(): TypeValue {
     return BUILDIN_TYPES.Type;
+  }
+
+  toString(): string {
+    return "Type";
   }
 }
 
@@ -1613,6 +1703,10 @@ class FnTypeValue extends TypeValue {
   toType(): TypeTypeValue {
     return BUILDIN_TYPES.Type;
   }
+
+  toString(): string {
+    return `(Fn ${this.args.join(" ")} -> ${this.returnType})`;
+  }
 }
 
 class FnArgValue {
@@ -1622,6 +1716,10 @@ class FnArgValue {
   constructor(name: string, type: TypeValue) {
     this.name = name;
     this.type = type;
+  }
+
+  toString(): string {
+    return `${this.name} ${this.type}`;
   }
 }
 
@@ -1644,6 +1742,10 @@ abstract class FnValue extends LValue {
       this.defArgs.map((x) => x.type),
       this.returnType,
     );
+  }
+
+  toString(): string {
+    return `(fn ${this.defArgs.join(" ")} -> ${this.returnType})`;
   }
 
   abstract call(env: Environment, args: LValue[]): LValue;
@@ -1683,6 +1785,8 @@ class FnUserValue extends FnValue {
       env.scope.set(defArg.name, actualArg);
     });
 
+    env.scope.set("self", this);
+
     // 関数のボディを実行
     let result = LNull;
     this.body.forEach((line) => {
@@ -1717,7 +1821,19 @@ class FnList<A> extends TypeValue {
     this.list = args;
   }
 
-  findType(args: TypeValue[]): FnTypeValue | undefined {
+  findMatch(args: TypeValue[]): A | undefined {
+    if (FnList.isType(this.list)) {
+      return this.#findMatchType(args) as A;
+    }
+
+    if (FnList.isValue(this.list)) {
+      return this.#findMatchValue(args) as A;
+    }
+
+    never();
+  }
+
+  #findMatchType(args: TypeValue[]): FnTypeValue | undefined {
     if (this.list.length === 0) return undefined;
     if (FnList.isType(this.list)) {
       const list = this.list.filter((x: FnTypeValue): boolean => {
@@ -1725,7 +1841,12 @@ class FnList<A> extends TypeValue {
         for (let i = 0; i < args.length; i++) {
           const def = x.args[i];
           const act = args[i];
-          if (!act.isAncestor(def)) return false;
+
+          if (act instanceof FnList && def instanceof FnTypeValue) {
+            if (!act.findFn(def)) return false;
+          } else {
+            if (!act.isAncestor(def)) return false;
+          }
         }
         return true;
       });
@@ -1742,7 +1863,7 @@ class FnList<A> extends TypeValue {
     } else never();
   }
 
-  findValue(args: TypeValue[]): FnValue | undefined {
+  #findMatchValue(args: TypeValue[]): FnValue | undefined {
     if (this.list.length === 0) return undefined;
     if (FnList.isValue(this.list)) {
       const list = this.list.filter((x: FnValue): boolean => {
@@ -1751,7 +1872,12 @@ class FnList<A> extends TypeValue {
         for (let i = 0; i < args.length; i++) {
           const def = type.args[i];
           const act = args[i];
-          if (!act.isAncestor(def)) return false;
+
+          if (act instanceof FnList && def instanceof FnTypeValue) {
+            if (!act.findFn(def)) return false;
+          } else {
+            if (!act.isAncestor(def)) return false;
+          }
         }
         return true;
       });
@@ -1766,6 +1892,52 @@ class FnList<A> extends TypeValue {
         );
       }
     } else never();
+  }
+
+  findFn(x: FnTypeValue): A | undefined {
+    if (FnList.isType(this.list)) {
+      return this.#findFnType(x) as A;
+    }
+
+    if (FnList.isValue(this.list)) {
+      return this.#findFnValue(x) as A;
+    }
+
+    never();
+  }
+
+  #findFnType(arg: FnTypeValue): FnTypeValue | undefined {
+    if (!FnList.isType(this.list)) never();
+
+    const list = (this.list as FnTypeValue[]).filter((x) => equalType(x, arg));
+
+    if (list.length === 0) {
+      return undefined;
+    } else if (list.length === 1) {
+      return list[0];
+    } else {
+      throw new Error(
+        `候補となる関数が複数見つかりました。一つになるように関数を追加してください。list=${list}`,
+      );
+    }
+  }
+
+  #findFnValue(arg: FnTypeValue): FnValue | undefined {
+    if (!FnList.isValue(this.list)) never();
+
+    const list = (this.list as FnValue[]).filter((x) =>
+      equalType(x.toType(), arg),
+    );
+
+    if (list.length === 0) {
+      return undefined;
+    } else if (list.length === 1) {
+      return list[0];
+    } else {
+      throw new Error(
+        `候補となる関数が複数見つかりました。一つになるように関数を追加してください。list=${list}`,
+      );
+    }
   }
 
   push(value: A): void {
@@ -1790,6 +1962,10 @@ class FnList<A> extends TypeValue {
     if (FnList.isValue(this.list)) {
       return new FnList(...(this.list as LValue[]).map((x) => x.toType()));
     } else never();
+  }
+
+  toString(): string {
+    return `(FnList ${this.list.join(" ")})`;
   }
 }
 
@@ -1834,6 +2010,10 @@ class StructTypeValue extends ConstructorTypeValue {
   toType(): TypeTypeValue {
     return BUILDIN_TYPES.Type;
   }
+
+  toString(): string {
+    return `(Struct ${this.fields.join(" ")})`;
+  }
 }
 
 class StructInstanceValue extends LValue {
@@ -1857,6 +2037,13 @@ class StructInstanceValue extends LValue {
   toType(): StructTypeValue {
     return new StructTypeValue(this.fields);
   }
+
+  toString(): string {
+    const text = [...this.map.entries()]
+      .map((x) => `${x[0]}: ${x[1]}`)
+      .join(" ");
+    return `(struct ${text})`;
+  }
 }
 
 class StructFieldValue {
@@ -1866,6 +2053,10 @@ class StructFieldValue {
   constructor(name: string, fieldType: TypeValue) {
     this.name = name;
     this.fieldType = fieldType;
+  }
+
+  toString(): string {
+    return `${this.name} ${this.fieldType};`;
   }
 }
 
@@ -1884,6 +2075,10 @@ class OrGenericTypeValue extends GenericTypeValue {
 
   toType(): TypeTypeValue {
     return BUILDIN_TYPES.Type;
+  }
+
+  toString(): string {
+    return `Or`;
   }
 }
 
@@ -1941,6 +2136,10 @@ class OrTypeValue extends ConstructorTypeValue {
   toType(): TypeTypeValue {
     return BUILDIN_TYPES.Type;
   }
+
+  toString(): string {
+    return `(Or ${this.types.join(" ")})`;
+  }
 }
 
 class OrInstanceValue extends LValue {
@@ -1956,9 +2155,13 @@ class OrInstanceValue extends LValue {
   toType(): OrTypeValue {
     return this.type;
   }
+
+  toString(): string {
+    return `(or ${this.value})`;
+  }
 }
 
-const BUILDIN_TYPES = {
+const BUILDIN_TYPES: Record<string, TypeValue> = {
   Num: new NumTypeValue(),
   Bool: new BoolTypeValue(),
   Null: new NullTypeValue(),
@@ -1970,19 +2173,23 @@ const BUILDIN_TYPES = {
 class Environment {
   scope: Scope<LValue, FnValue>;
   compileScope: Scope<TypeValue, FnTypeValue>;
-  readonly buildinType: Record<string, TypeValue>;
-  readonly buildinFn: Record<string, FnBuildinValue>;
+  readonly buildinFn: Record<string, FnBuildinValue | FnList<FnBuildinValue>>;
 
   constructor() {
     this.scope = new Scope(FnValue.is);
     this.compileScope = new Scope(FnTypeValue.is);
 
-    this.buildinType = BUILDIN_TYPES;
-
     this.buildinFn = {
+      break: new FnBuildinValue(
+        [new FnArgValue("value", BUILDIN_TYPES.Any)],
+        BUILDIN_TYPES.Null,
+        (value: LValue) => {
+          throw new Break(value);
+        },
+      ),
       print: new FnBuildinValue(
-        [new FnArgValue("arg", this.buildinType.Any)],
-        this.buildinType.Null,
+        [new FnArgValue("arg", BUILDIN_TYPES.Any)],
+        BUILDIN_TYPES.Null,
         (...args: LValue[]) => {
           console.log(...args);
           return LNull;
@@ -1990,10 +2197,10 @@ class Environment {
       ),
       add: new FnBuildinValue(
         [
-          new FnArgValue("a", this.buildinType.Num),
-          new FnArgValue("b", this.buildinType.Num),
+          new FnArgValue("a", BUILDIN_TYPES.Num),
+          new FnArgValue("b", BUILDIN_TYPES.Num),
         ],
-        this.buildinType.Num,
+        BUILDIN_TYPES.Num,
         (...args) => {
           const ret = args.reduce((acc, x) => {
             if (!(x instanceof NumValue)) throw new Error(`never`);
@@ -2002,11 +2209,95 @@ class Environment {
           return new NumValue(ret);
         },
       ),
+      sub: new FnBuildinValue(
+        [
+          new FnArgValue("a", BUILDIN_TYPES.Num),
+          new FnArgValue("b", BUILDIN_TYPES.Num),
+        ],
+        BUILDIN_TYPES.Num,
+        (...args) => {
+          const a = args[0];
+          const b = args[1];
+          if (!(a instanceof NumValue)) never();
+          if (!(b instanceof NumValue)) never();
+          return new NumValue(a.value - b.value);
+        },
+      ),
+      eq: new FnBuildinValue(
+        [
+          new FnArgValue("a", BUILDIN_TYPES.Num),
+          new FnArgValue("b", BUILDIN_TYPES.Num),
+        ],
+        BUILDIN_TYPES.Bool,
+        (...args) => {
+          const a = args[0];
+          const b = args[1];
+          if (!(a instanceof NumValue)) never();
+          if (!(b instanceof NumValue)) never();
+          return new BoolValue(a.value === b.value);
+        },
+      ),
+      "<": new FnBuildinValue(
+        [
+          new FnArgValue("a", BUILDIN_TYPES.Num),
+          new FnArgValue("b", BUILDIN_TYPES.Num),
+        ],
+        BUILDIN_TYPES.Bool,
+        (...args) => {
+          const a = args[0];
+          const b = args[1];
+          if (!(a instanceof NumValue)) never();
+          if (!(b instanceof NumValue)) never();
+          return new BoolValue(a.value < b.value);
+        },
+      ),
+      "<=": new FnBuildinValue(
+        [
+          new FnArgValue("a", BUILDIN_TYPES.Num),
+          new FnArgValue("b", BUILDIN_TYPES.Num),
+        ],
+        BUILDIN_TYPES.Bool,
+        (...args) => {
+          const a = args[0];
+          const b = args[1];
+          if (!(a instanceof NumValue)) never();
+          if (!(b instanceof NumValue)) never();
+          return new BoolValue(a.value <= b.value);
+        },
+      ),
+      ">": new FnBuildinValue(
+        [
+          new FnArgValue("a", BUILDIN_TYPES.Num),
+          new FnArgValue("b", BUILDIN_TYPES.Num),
+        ],
+        BUILDIN_TYPES.Bool,
+        (...args) => {
+          const a = args[0];
+          const b = args[1];
+          if (!(a instanceof NumValue)) never();
+          if (!(b instanceof NumValue)) never();
+          return new BoolValue(a.value > b.value);
+        },
+      ),
+      ">=": new FnBuildinValue(
+        [
+          new FnArgValue("a", BUILDIN_TYPES.Num),
+          new FnArgValue("b", BUILDIN_TYPES.Num),
+        ],
+        BUILDIN_TYPES.Bool,
+        (...args) => {
+          const a = args[0];
+          const b = args[1];
+          if (!(a instanceof NumValue)) never();
+          if (!(b instanceof NumValue)) never();
+          return new BoolValue(a.value >= b.value);
+        },
+      ),
     };
 
-    for (const key in this.buildinType) {
-      this.scope.set(key, this.buildinType[key]);
-      this.compileScope.set(key, this.buildinType[key]);
+    for (const key in BUILDIN_TYPES) {
+      this.scope.set(key, BUILDIN_TYPES[key]);
+      this.compileScope.set(key, BUILDIN_TYPES[key]);
     }
     for (const key in this.buildinFn) {
       this.scope.set(key, this.buildinFn[key]);

@@ -1,11 +1,11 @@
 import { interprete } from "./interpreter.ts";
 
 interprete(`
-           add = fn a Num b Null -> Num { a }
-           add = fn a Null b Num -> Num { b }
-           add = fn a Null b Null -> Null { null }
+           times = fn count Num callback (Fn Num -> Null) -> Null {
+             if (<= count 0) {} {
+               self (sub count 1) callback
+             }
+           }
 
-           print (add 1 null)
-           print (add null 2)
-           print (add null null)
+           times 3 (fn i Num -> Null {print i})
 `);
